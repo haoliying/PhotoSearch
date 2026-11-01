@@ -1,0 +1,104 @@
+package com.example.photosearch
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModelProvider
+import com.example.photosearch.ui.screens.HomeScreen
+import com.example.photosearch.ui.screens.PhotoDetailScreen
+import com.example.photosearch.ui.theme.PhotoSearchTheme
+import com.example.photosearch.viewmodel.PhotoViewModel
+
+class MainActivity : ComponentActivity() {
+
+    private lateinit var viewModel: PhotoViewModel
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (!isGranted) {
+            // Permission denied - app will show empty state
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        viewModel = ViewModelProvider(this)[PhotoViewModel::class.java]
+
+        checkAndRequestPermission()
+
+        setContent {
+            PhotoSearchTheme {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    val state by viewModel.state.collectAsState()
+
+                    when {
+                        state.selectedPhoto != null -> {
+                            PhotoDetailScreen(
+                                photo = state.selectedPhoto!!,
+                                onBack = { viewModel.selectPhoto(null) },
+                                onShare = { sharePhoto(state.selectedPhoto!!) }
+                            )
+                        }
+                        else -> {
+                            HomeScreen(
+                                photos = state.filteredPhotos,
+                                isLoading = state.isLoading,
+                                isAnalyzing = state.isAnalyzing,
+                                analysisProgress = state.analysisProgress,
+                                analysisTotal = state.analysisTotal,
+                                hasAnalyzed = state.hasAnalyzed,
+                                searchQuery = state.searchQuery,
+                                onSearch = { viewModel.search(it) },
+                                onPhotoClick = { viewModel.selectPhoto(it) },
+                                onStartAnalysis = { viewModel.startAnalysis() },
+                                suggestions = viewModel.getSuggestions(),
+                                ruleDescription = viewModel.getRuleDescription()
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun checkAndRequestPermission() {
+        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.READ_MEDIA_IMAGES
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+
+        if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+            permissionLauncher.launch(permission)
+        }
+    }
+
+    private fun sharePhoto(photo: com.example.photosearch.data.PhotoItem) {
+        val shareUri = viewModel.getShareUri(photo)
+        if (shareUri != null) {
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "image/*"
+                putExtra(Intent.EXTRA_STREAM, shareUri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(shareIntent, "分享照片"))
+        }
+    }
+}

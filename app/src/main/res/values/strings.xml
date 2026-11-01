@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">智能相册搜索</string>
+    <string name="search_hint">搜索照片内容，如：有车、泰山、海滩…</string>
+    <string name="analyzing">正在分析照片…</string>
+    <string name="analysis_complete">分析完成</string>
+    <string name="no_results">未找到匹配的照片</string>
+    <string name="share_photo">分享照片</string>
+    <string name="permission_required">需要相册访问权限才能搜索照片</string>
+    <string name="grant_permission">授予权限</string>
+    <string name="photos_count">共 %d 张照片</string>
+    <string name="analyzed_count">已分析 %d / %d</string>
+    <string name="start_analysis">开始智能分析</string>
+    <string name="label_confidence">置信度: %.1f%%</string>
+</resources>
