@@ -27,18 +27,18 @@ class MainActivity : ComponentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (!isGranted) {
-            // Permission denied - app will show empty state
-        }
-    }
+    ) { /* no-op: app handles missing permission gracefully */ }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* notification permission is optional, app still works without it */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         viewModel = ViewModelProvider(this)[PhotoViewModel::class.java]
 
-        checkAndRequestPermission()
+        requestPermissions()
 
         setContent {
             PhotoSearchTheme {
@@ -78,15 +78,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun checkAndRequestPermission() {
-        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+    private fun requestPermissions() {
+        // Photo access permission
+        val photoPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             Manifest.permission.READ_MEDIA_IMAGES
         } else {
             Manifest.permission.READ_EXTERNAL_STORAGE
         }
+        if (ContextCompat.checkSelfPermission(this, photoPermission) != PackageManager.PERMISSION_GRANTED) {
+            permissionLauncher.launch(photoPermission)
+        }
 
-        if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
-            permissionLauncher.launch(permission)
+        // Notification permission (Android 13+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
         }
     }
 

@@ -1,18 +1,20 @@
 package com.example.photosearch.viewmodel
 
 import android.app.Application
+import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.photosearch.data.PhotoItem
+import com.example.photosearch.data.PhotoLabel
 import com.example.photosearch.data.PhotoRepository
-import com.example.photosearch.ml.ImageAnalyzer
 import com.example.photosearch.ml.SearchConditionMapper
+import com.example.photosearch.service.AnalysisService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.util.concurrent.atomic.AtomicInteger
 
 data class PhotoSearchState(
     val allPhotos: List<PhotoItem> = emptyList(),
@@ -30,14 +32,13 @@ data class PhotoSearchState(
 class PhotoViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = PhotoRepository(application)
-    private val analyzer = ImageAnalyzer(application)
-    private val analyzedLabels = mutableMapOf<Long, List<com.example.photosearch.data.PhotoLabel>>()
 
     private val _state = MutableStateFlow(PhotoSearchState())
     val state: StateFlow<PhotoSearchState> = _state.asStateFlow()
 
     init {
         loadPhotos()
+        observeServiceState()
     }
 
     private fun loadPhotos() {
@@ -45,10 +46,24 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
             _state.value = _state.value.copy(isLoading = true, error = null)
             try {
                 val photos = repository.loadAllPhotos()
+                // If service already has analysis results, merge them
+                val merged = if (AnalysisService.allPhotos.isNotEmpty()) {
+                    photos.map { photo ->
+                        val labels = AnalysisService.analyzedLabels[photo.id]
+                        if (labels != null) {
+                            photo.copy(labels = labels, isAnalyzed = true)
+                        } else photo
+                    }
+                } else photos
+
+                val hasAnalyzed = AnalysisService.analysisState.value.isComplete ||
+                        AnalysisService.analyzedLabels.isNotEmpty()
+
                 _state.value = _state.value.copy(
-                    allPhotos = photos,
-                    filteredPhotos = photos,
-                    isLoading = false
+                    allPhotos = merged,
+                    filteredPhotos = merged,
+                    isLoading = false,
+                    hasAnalyzed = hasAnalyzed
                 )
             } catch (e: Exception) {
                 _state.value = _state.value.copy(
@@ -59,56 +74,65 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun startAnalysis() {
-        if (_state.value.isAnalyzing) return
-
+    /**
+     * Observe the foreground service's shared state flow and sync into UI state.
+     * This keeps working even when the user leaves the Activity — the service
+     * continues running and updates are picked up when the Activity resumes.
+     */
+    private fun observeServiceState() {
         viewModelScope.launch {
-            val photos = _state.value.allPhotos
-            _state.value = _state.value.copy(
-                isAnalyzing = true,
-                analysisProgress = 0,
-                analysisTotal = photos.size
-            )
-
-            val processedCount = AtomicInteger(0)
-            val batchSize = 3
-            val totalBatches = (photos.size + batchSize - 1) / batchSize
-
-            for (batchIndex in 0 until totalBatches) {
-                val start = batchIndex * batchSize
-                val end = minOf(start + batchSize, photos.size)
-                val batch = photos.subList(start, end)
-
-                val results = batch.map { photo ->
-                    val labels = analyzer.analyzePhoto(photo.uri, getApplication())
-                    photo.id to labels
-                }
-
-                results.forEach { (id, labels) ->
-                    analyzedLabels[id] = labels
-                }
-
-                val current = processedCount.addAndGet(batch.size)
+            AnalysisService.analysisState.collect { serviceProgress ->
                 _state.value = _state.value.copy(
-                    analysisProgress = current,
-                    allPhotos = _state.value.allPhotos.map { p ->
-                        if (analyzedLabels.containsKey(p.id)) {
-                            p.copy(labels = analyzedLabels[p.id] ?: emptyList(), isAnalyzed = true)
-                        } else p
-                    }
+                    isAnalyzing = serviceProgress.isRunning,
+                    analysisProgress = serviceProgress.progress,
+                    analysisTotal = serviceProgress.total,
+                    hasAnalyzed = serviceProgress.isComplete || _state.value.hasAnalyzed
                 )
-            }
 
-            _state.value = _state.value.copy(
-                isAnalyzing = false,
-                hasAnalyzed = true
-            )
-
-            // Re-apply search if there's a query
-            if (_state.value.searchQuery.isNotBlank()) {
-                search(_state.value.searchQuery)
+                // When service finishes, sync all analyzed labels into photo list
+                if (serviceProgress.isComplete && AnalysisService.analyzedLabels.isNotEmpty()) {
+                    syncServiceResults()
+                }
             }
         }
+    }
+
+    private fun syncServiceResults() {
+        val labels = AnalysisService.analyzedLabels
+        _state.value = _state.value.copy(
+            allPhotos = _state.value.allPhotos.map { photo ->
+                val photoLabels = labels[photo.id]
+                if (photoLabels != null) {
+                    photo.copy(labels = photoLabels, isAnalyzed = true)
+                } else photo
+            }
+        )
+        // Re-apply search filter with updated labels
+        if (_state.value.searchQuery.isNotBlank()) {
+            search(_state.value.searchQuery)
+        } else {
+            _state.value = _state.value.copy(filteredPhotos = _state.value.allPhotos)
+        }
+    }
+
+    /**
+     * Start the foreground service for background analysis.
+     * The service will continue running even if the user navigates away.
+     */
+    fun startAnalysis() {
+        if (_state.value.isAnalyzing || AnalysisService.isRunning()) return
+
+        val context = getApplication<Application>()
+
+        // For Android 12+ we need to use startForegroundService properly
+        val serviceIntent = Intent(context, AnalysisService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(serviceIntent)
+        } else {
+            context.startService(serviceIntent)
+        }
+
+        _state.value = _state.value.copy(isAnalyzing = true)
     }
 
     fun search(query: String) {
@@ -153,9 +177,4 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
 
     fun getRuleDescription(): String? =
         SearchConditionMapper.getRuleDescription(_state.value.searchQuery)
-
-    override fun onCleared() {
-        super.onCleared()
-        analyzer.close()
-    }
 }
