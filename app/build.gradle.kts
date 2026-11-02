@@ -52,9 +52,11 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.7.5")
 
-    // ML Kit - Image Labeling
+    // ML Kit - Image Analysis
     implementation("com.google.mlkit:image-labeling:17.0.8")
     implementation("com.google.mlkit:image-labeling-custom:17.0.2")
+    implementation("com.google.mlkit:object-detection:17.0.1")
+    implementation("com.google.mlkit:face-detection:16.1.5")
 
     // Coil for image loading in Compose
     implementation("io.coil-kt:coil-compose:2.5.0")

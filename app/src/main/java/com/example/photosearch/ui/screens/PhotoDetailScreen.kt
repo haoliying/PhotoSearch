@@ -1,6 +1,5 @@
 package com.example.photosearch.ui.screens
 
-import android.content.Intent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -13,28 +12,27 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import com.example.photosearch.data.PhotoItem
+import com.example.photosearch.data.PhotoMetadata
+import com.example.photosearch.data.SceneType
 import com.example.photosearch.ui.theme.*
 import java.text.SimpleDateFormat
 import java.util.*
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun PhotoDetailScreen(
     photo: PhotoItem,
     onBack: () -> Unit,
     onShare: () -> Unit
 ) {
-    val context = LocalContext.current
-
     Scaffold(
         topBar = {
             TopAppBar(
@@ -60,7 +58,6 @@ fun PhotoDetailScreen(
                 .background(Background)
                 .verticalScroll(rememberScrollState())
         ) {
-            // Photo
             AsyncImage(
                 model = photo.uri,
                 contentDescription = photo.displayName,
@@ -72,7 +69,6 @@ fun PhotoDetailScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Info card
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -81,7 +77,6 @@ fun PhotoDetailScreen(
                 colors = CardDefaults.cardColors(containerColor = Surface)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    // File name
                     Text(
                         text = photo.displayName,
                         style = MaterialTheme.typography.titleMedium,
@@ -90,7 +85,6 @@ fun PhotoDetailScreen(
 
                     Spacer(modifier = Modifier.height(4.dp))
 
-                    // Date
                     val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
                     Text(
                         text = dateFormat.format(Date(photo.dateTaken)),
@@ -98,36 +92,102 @@ fun PhotoDetailScreen(
                         color = OnSurface.copy(alpha = 0.6f)
                     )
 
-                    // Labels
-                    if (photo.labels.isNotEmpty()) {
+                    val metadata = photo.metadata
+
+                    if (metadata != null && metadata.isAnalyzed) {
                         Spacer(modifier = Modifier.height(12.dp))
                         Divider()
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        Text(
-                            text = "识别标签",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Medium
-                        )
+                        // Scene type
+                        if (metadata.sceneType != SceneType.UNKNOWN) {
+                            InfoRow("场景类型", sceneTypeName(metadata.sceneType))
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
 
-                        Spacer(modifier = Modifier.height(8.dp))
+                        // Outdoor/Indoor
+                        metadata.isOutdoor?.let { isOutdoor ->
+                            InfoRow("环境", if (isOutdoor) "户外" else "室内")
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
 
-                        // Label chips
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            photo.labels.sortedByDescending { it.confidence }.forEach { label ->
-                                LabelChip(
-                                    text = label.text,
-                                    confidence = label.confidence
-                                )
+                        // Detected objects
+                        if (metadata.detectedObjects.isNotEmpty()) {
+                            Text(
+                                text = "识别物体",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                metadata.detectedObjects.forEach { obj ->
+                                    LabelChip(obj.label, obj.confidence)
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+
+                        // Face info
+                        if (metadata.faces.isNotEmpty()) {
+                            InfoRow("人脸数量", "${metadata.faces.size} 张人脸")
+                            metadata.faces.forEachIndexed { index, face ->
+                                val details = buildList {
+                                    if (face.smilingProbability > 0.5f) add("微笑")
+                                    if (face.leftEyeOpenProbability > 0.5f) add("左眼睁开")
+                                    if (face.rightEyeOpenProbability > 0.5f) add("右眼睁开")
+                                }
+                                if (details.isNotEmpty()) {
+                                    InfoRow("人脸 ${index + 1}", details.joinToString("、"))
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+
+                        // Labels
+                        if (metadata.labels.isNotEmpty()) {
+                            Text(
+                                text = "内容标签",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                metadata.labels.sortedByDescending { it.confidence }.forEach { label ->
+                                    LabelChip(label.text, label.confidence)
+                                }
+                            }
+                        }
+
+                        // Dominant colors
+                        if (metadata.dominantColors.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "主色调",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                metadata.dominantColors.take(5).forEach { color ->
+                                    Box(
+                                        modifier = Modifier
+                                            .size(28.dp)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(Color(color))
+                                    )
+                                }
                             }
                         }
                     } else if (photo.isAnalyzed) {
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = "未识别到标签",
+                            text = "未识别到详细信息",
                             style = MaterialTheme.typography.bodyMedium,
                             color = OnSurface.copy(alpha = 0.5f)
                         )
@@ -140,7 +200,6 @@ fun PhotoDetailScreen(
                         )
                     }
 
-                    // Share button
                     Spacer(modifier = Modifier.height(16.dp))
                     Button(
                         onClick = onShare,
@@ -157,6 +216,26 @@ fun PhotoDetailScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
         }
+    }
+}
+
+@Composable
+private fun InfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = OnSurface.copy(alpha = 0.6f)
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.Medium,
+            color = OnSurface
+        )
     }
 }
 
@@ -187,18 +266,20 @@ private fun LabelChip(text: String, confidence: Float) {
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun FlowRow(
-    modifier: Modifier = Modifier,
-    horizontalArrangement: Arrangement.Horizontal = Arrangement.Start,
-    verticalArrangement: Arrangement.Vertical = Arrangement.Top,
-    content: @Composable () -> Unit
-) {
-    androidx.compose.foundation.layout.FlowRow(
-        modifier = modifier,
-        horizontalArrangement = horizontalArrangement,
-        verticalArrangement = verticalArrangement,
-        content = { content() }
-    )
+private fun sceneTypeName(scene: SceneType): String = when (scene) {
+    SceneType.OUTDOOR_NATURE -> "户外自然"
+    SceneType.OUTDOOR_URBAN -> "城市建筑"
+    SceneType.INDOOR_HOME -> "室内家居"
+    SceneType.INDOOR_PUBLIC -> "室内公共场所"
+    SceneType.INDOOR_EVENT -> "室内活动"
+    SceneType.BEACH_SEA -> "海滩/海边"
+    SceneType.MOUNTAIN_HILL -> "山景"
+    SceneType.NIGHT_SCENE -> "夜景"
+    SceneType.FOOD_DRINK -> "美食"
+    SceneType.SPORT_EXERCISE -> "运动"
+    SceneType.VEHICLE_SCENE -> "车辆"
+    SceneType.ANIMAL_PET -> "动物/宠物"
+    SceneType.PEOPLE_PORTRAIT -> "人物"
+    SceneType.LANDSCAPE -> "风景"
+    SceneType.UNKNOWN -> "未知"
 }

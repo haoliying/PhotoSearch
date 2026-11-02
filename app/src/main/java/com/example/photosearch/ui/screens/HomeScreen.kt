@@ -47,6 +47,7 @@ fun HomeScreen(
     canResume: Boolean,
     savedProgress: Int,
     savedTotal: Int,
+    searchResultCount: Int,
     suggestions: List<String>,
     ruleDescription: String?
 ) {
@@ -107,10 +108,9 @@ fun HomeScreen(
             // Photo count
             if (!isLoading) {
                 Text(
-                    text = if (searchQuery.isNotBlank()) {
-                        "找到 ${photos.size} 张匹配照片"
-                    } else {
-                        "共 ${photos.size} 张照片"
+                    text = when {
+                        searchQuery.isNotBlank() -> "找到 ${searchResultCount} 张匹配照片"
+                        else -> "共 ${photos.size} 张照片"
                     },
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                     style = MaterialTheme.typography.bodyMedium,

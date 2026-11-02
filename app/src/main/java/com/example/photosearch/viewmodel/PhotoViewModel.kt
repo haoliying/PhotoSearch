@@ -6,10 +6,10 @@ import android.net.Uri
 import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.photosearch.data.AnalysisResultStore
-import com.example.photosearch.data.PhotoItem
-import com.example.photosearch.data.PhotoRepository
+import com.example.photosearch.data.*
 import com.example.photosearch.ml.SearchConditionMapper
+import com.example.photosearch.search.IntentParser
+import com.example.photosearch.search.SearchEngine
 import com.example.photosearch.service.AnalysisService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -29,16 +29,20 @@ data class PhotoSearchState(
     val isLoading: Boolean = false,
     val error: String? = null,
     val selectedPhoto: PhotoItem? = null,
-    // Resume support
     val canResume: Boolean = false,
     val savedProgress: Int = 0,
-    val savedTotal: Int = 0
+    val savedTotal: Int = 0,
+    val searchResultCount: Int = 0,
+    val searchDescription: String? = null
 )
 
 class PhotoViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = PhotoRepository(application)
     private val resultStore = AnalysisResultStore(application)
+
+    // In-memory metadata cache
+    private val metadataCache = mutableMapOf<Long, PhotoMetadata>()
 
     private val _state = MutableStateFlow(PhotoSearchState())
     val state: StateFlow<PhotoSearchState> = _state.asStateFlow()
@@ -54,23 +58,30 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val photos = repository.loadAllPhotos()
 
-                // Check for saved analysis results on disk
+                // Load saved metadata from disk
                 val saved = withContext(Dispatchers.IO) { resultStore.load() }
 
-                // Merge: service in-memory cache takes priority, then disk cache
+                // Build metadata map: service memory > disk cache
+                metadataCache.clear()
+                saved?.metadataMap?.let { metadataCache.putAll(it) }
+                metadataCache.putAll(AnalysisService.analyzedMetadata)
+
+                // Merge metadata into photo items
                 val merged = photos.map { photo ->
-                    val labels = AnalysisService.analyzedLabels[photo.id]
-                        ?: saved?.results?.get(photo.id)
-                    if (labels != null) {
-                        photo.copy(labels = labels, isAnalyzed = true)
+                    val metadata = metadataCache[photo.id]
+                    if (metadata != null && metadata.isAnalyzed) {
+                        photo.copy(
+                            labels = metadata.labels,
+                            metadata = metadata,
+                            isAnalyzed = true
+                        )
                     } else photo
                 }
 
                 val hasAnalyzed = AnalysisService.analysisState.value.isComplete ||
                         saved?.isComplete == true ||
-                        AnalysisService.analyzedLabels.isNotEmpty()
+                        metadataCache.isNotEmpty()
 
-                // Determine if we can resume an incomplete analysis
                 val canResume = saved != null && !saved.isComplete &&
                         saved.analyzedCount > 0 && saved.totalPhotos == photos.size
 
@@ -92,23 +103,24 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Observe the foreground service's shared state flow and sync into UI state.
-     */
     private fun observeServiceState() {
         viewModelScope.launch {
             AnalysisService.analysisState.collect { serviceProgress ->
+                // Sync metadata from service
+                if (AnalysisService.analyzedMetadata.isNotEmpty()) {
+                    metadataCache.putAll(AnalysisService.analyzedMetadata)
+                }
+
                 _state.value = _state.value.copy(
                     isAnalyzing = serviceProgress.isRunning,
                     analysisProgress = serviceProgress.progress,
                     analysisTotal = serviceProgress.total,
-                    hasAnalyzed = serviceProgress.isComplete || _state.value.hasAnalyzed,
+                    hasAnalyzed = serviceProgress.isComplete || _state.value.hasAnalyzed || metadataCache.isNotEmpty(),
                     canResume = if (serviceProgress.isRunning || serviceProgress.isComplete) false
                                 else _state.value.canResume
                 )
 
-                // When service finishes, sync all analyzed labels into photo list
-                if (serviceProgress.isComplete && AnalysisService.analyzedLabels.isNotEmpty()) {
+                if (serviceProgress.isComplete || serviceProgress.progress > 0) {
                     syncServiceResults()
                 }
             }
@@ -116,18 +128,23 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun syncServiceResults() {
-        val labels = AnalysisService.analyzedLabels
         _state.value = _state.value.copy(
             allPhotos = _state.value.allPhotos.map { photo ->
-                val photoLabels = labels[photo.id]
-                if (photoLabels != null) {
-                    photo.copy(labels = photoLabels, isAnalyzed = true)
+                val metadata = metadataCache[photo.id]
+                if (metadata != null && metadata.isAnalyzed) {
+                    photo.copy(
+                        labels = metadata.labels,
+                        metadata = metadata,
+                        isAnalyzed = true
+                    )
                 } else photo
             },
             canResume = false,
             savedProgress = 0,
             savedTotal = 0
         )
+
+        // Re-apply search if there's a query
         if (_state.value.searchQuery.isNotBlank()) {
             search(_state.value.searchQuery)
         } else {
@@ -135,10 +152,6 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Start the foreground service for background analysis.
-     * If there's saved progress, the service will automatically resume from where it left off.
-     */
     fun startAnalysis() {
         if (_state.value.isAnalyzing || AnalysisService.isRunning()) return
 
@@ -153,19 +166,17 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         _state.value = _state.value.copy(isAnalyzing = true)
     }
 
-    /**
-     * Clear saved analysis results and start a fresh analysis.
-     */
     fun restartAnalysis() {
         if (_state.value.isAnalyzing || AnalysisService.isRunning()) return
 
         viewModelScope.launch {
             withContext(Dispatchers.IO) { resultStore.clear() }
             AnalysisService.reset()
+            metadataCache.clear()
 
             _state.value = _state.value.copy(
-                allPhotos = _state.value.allPhotos.map { it.copy(labels = emptyList(), isAnalyzed = false) },
-                filteredPhotos = _state.value.allPhotos.map { it.copy(labels = emptyList(), isAnalyzed = false) },
+                allPhotos = _state.value.allPhotos.map { it.copy(labels = emptyList(), metadata = null, isAnalyzed = false) },
+                filteredPhotos = _state.value.allPhotos.map { it.copy(labels = emptyList(), metadata = null, isAnalyzed = false) },
                 hasAnalyzed = false,
                 canResume = false,
                 savedProgress = 0,
@@ -176,16 +187,32 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Search photos using the new semantic search engine.
+     * Parses natural language intent and matches against rich metadata.
+     */
     fun search(query: String) {
         _state.value = _state.value.copy(searchQuery = query)
 
         if (query.isBlank()) {
-            _state.value = _state.value.copy(filteredPhotos = _state.value.allPhotos)
+            _state.value = _state.value.copy(
+                filteredPhotos = _state.value.allPhotos,
+                searchResultCount = 0,
+                searchDescription = null
+            )
             return
         }
 
-        val results = SearchConditionMapper.matchPhotos(query, _state.value.allPhotos)
-        _state.value = _state.value.copy(filteredPhotos = results)
+        // Use the new SearchEngine with IntentParser
+        val results = SearchEngine.quickSearch(query, _state.value.allPhotos, metadataCache)
+
+        val description = IntentParser.getDescription(query)
+
+        _state.value = _state.value.copy(
+            filteredPhotos = results.map { it.photo },
+            searchResultCount = results.size,
+            searchDescription = description
+        )
     }
 
     fun selectPhoto(photo: PhotoItem?) {
@@ -214,8 +241,7 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun getSuggestions(): List<String> = SearchConditionMapper.getSuggestions()
+    fun getSuggestions(): List<String> = IntentParser.getSuggestions()
 
-    fun getRuleDescription(): String? =
-        SearchConditionMapper.getRuleDescription(_state.value.searchQuery)
+    fun getRuleDescription(): String? = _state.value.searchDescription
 }

@@ -13,5 +13,6 @@ data class PhotoItem(
     val dateTaken: Long,
     val displayName: String,
     val labels: List<PhotoLabel> = emptyList(),
+    val metadata: PhotoMetadata? = null,
     val isAnalyzed: Boolean = false
 )

@@ -6,7 +6,7 @@ import org.json.JSONObject
 import java.io.File
 
 /**
- * Persists photo analysis results to local storage.
+ * Persists photo analysis results (PhotoMetadata) to local storage.
  * Saves incrementally after each segment to prevent data loss on crash/exit.
  */
 class AnalysisResultStore(context: Context) {
@@ -22,28 +22,22 @@ class AnalysisResultStore(context: Context) {
         private const val KEY_IS_COMPLETE = "isComplete"
         private const val KEY_RESULTS = "results"
         private const val KEY_PHOTO_ID = "photoId"
-        private const val KEY_LABELS = "labels"
-        private const val KEY_LABEL_TEXT = "text"
-        private const val KEY_LABEL_CONFIDENCE = "confidence"
-        private const val CURRENT_VERSION = 1
+        private const val KEY_METADATA = "metadata"
+        private const val CURRENT_VERSION = 2
     }
 
     data class StoredAnalysis(
         val totalPhotos: Int,
         val analyzedCount: Int,
         val isComplete: Boolean,
-        val results: Map<Long, List<PhotoLabel>>
+        val metadataMap: Map<Long, PhotoMetadata>
     )
 
-    /**
-     * Save analysis results incrementally.
-     * Call this after each segment completes.
-     */
     fun saveSegment(
         totalPhotos: Int,
         analyzedCount: Int,
         isComplete: Boolean,
-        results: Map<Long, List<PhotoLabel>>
+        metadataMap: Map<Long, PhotoMetadata>
     ) {
         synchronized(lock) {
             try {
@@ -54,34 +48,25 @@ class AnalysisResultStore(context: Context) {
                     put(KEY_IS_COMPLETE, isComplete)
 
                     val resultsArray = JSONArray()
-                    results.forEach { (photoId, labels) ->
-                        val photoJson = JSONObject().apply {
+                    metadataMap.forEach { (photoId, metadata) ->
+                        resultsArray.put(JSONObject().apply {
                             put(KEY_PHOTO_ID, photoId)
-                            put(KEY_LABELS, JSONArray().apply {
-                                labels.forEach { label ->
-                                    put(JSONObject().apply {
-                                        put(KEY_LABEL_TEXT, label.text)
-                                        put(KEY_LABEL_CONFIDENCE, label.confidence.toDouble())
-                                    })
-                                }
-                            })
-                        }
-                        resultsArray.put(photoJson)
+                            put(KEY_METADATA, serializeMetadata(metadata))
+                        })
                     }
                     put(KEY_RESULTS, resultsArray)
                 }
 
-                storeFile.writeText(json.toString())
+                // Write atomically: write to temp file then rename
+                val tempFile = File(storeFile.parent, "${FILE_NAME}.tmp")
+                tempFile.writeText(json.toString())
+                tempFile.renameTo(storeFile)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
     }
 
-    /**
-     * Load previously saved analysis results.
-     * Returns null if no saved data exists or data is corrupted.
-     */
     fun load(): StoredAnalysis? {
         synchronized(lock) {
             return try {
@@ -95,26 +80,16 @@ class AnalysisResultStore(context: Context) {
                 val analyzedCount = json.getInt(KEY_ANALYZED_COUNT)
                 val isComplete = json.getBoolean(KEY_IS_COMPLETE)
 
-                val results = mutableMapOf<Long, List<PhotoLabel>>()
+                val metadataMap = mutableMapOf<Long, PhotoMetadata>()
                 val resultsArray = json.getJSONArray(KEY_RESULTS)
                 for (i in 0 until resultsArray.length()) {
-                    val photoJson = resultsArray.getJSONObject(i)
-                    val photoId = photoJson.getLong(KEY_PHOTO_ID)
-                    val labelsArray = photoJson.getJSONArray(KEY_LABELS)
-                    val labels = mutableListOf<PhotoLabel>()
-                    for (j in 0 until labelsArray.length()) {
-                        val labelJson = labelsArray.getJSONObject(j)
-                        labels.add(
-                            PhotoLabel(
-                                text = labelJson.getString(KEY_LABEL_TEXT),
-                                confidence = labelJson.getDouble(KEY_LABEL_CONFIDENCE).toFloat()
-                            )
-                        )
-                    }
-                    results[photoId] = labels
+                    val entry = resultsArray.getJSONObject(i)
+                    val photoId = entry.getLong(KEY_PHOTO_ID)
+                    val metadataJson = entry.getJSONObject(KEY_METADATA)
+                    metadataMap[photoId] = deserializeMetadata(metadataJson)
                 }
 
-                StoredAnalysis(totalPhotos, analyzedCount, isComplete, results)
+                StoredAnalysis(totalPhotos, analyzedCount, isComplete, metadataMap)
             } catch (e: Exception) {
                 e.printStackTrace()
                 null
@@ -122,9 +97,6 @@ class AnalysisResultStore(context: Context) {
         }
     }
 
-    /**
-     * Clear all saved results (e.g., when user wants to re-analyze).
-     */
     fun clear() {
         synchronized(lock) {
             if (storeFile.exists()) {
@@ -133,10 +105,126 @@ class AnalysisResultStore(context: Context) {
         }
     }
 
-    /**
-     * Check if there's saved progress that can be resumed.
-     */
     fun hasProgress(): Boolean {
         return storeFile.exists() && load()?.let { !it.isComplete && it.analyzedCount > 0 } == true
+    }
+
+    // --- Serialization ---
+
+    private fun serializeMetadata(m: PhotoMetadata): JSONObject {
+        return JSONObject().apply {
+            put("photoId", m.photoId)
+            put("sceneType", m.sceneType.name)
+            put("isOutdoor", m.isOutdoor)
+            put("hasText", m.hasText)
+            put("width", m.width)
+            put("height", m.height)
+            put("isAnalyzed", m.isAnalyzed)
+
+            // Labels
+            put("labels", JSONArray().apply {
+                m.labels.forEach { l ->
+                    put(JSONObject().apply {
+                        put("text", l.text)
+                        put("confidence", l.confidence.toDouble())
+                    })
+                }
+            })
+
+            // Detected objects
+            put("objects", JSONArray().apply {
+                m.detectedObjects.forEach { o ->
+                    put(JSONObject().apply {
+                        put("label", o.label)
+                        put("confidence", o.confidence.toDouble())
+                        o.boundingBox?.let { bb ->
+                            put("bbox", JSONObject().apply {
+                                put("left", bb.left)
+                                put("top", bb.top)
+                                put("width", bb.width)
+                                put("height", bb.height)
+                            })
+                        }
+                    })
+                }
+            })
+
+            // Faces
+            put("faces", JSONArray().apply {
+                m.faces.forEach { f ->
+                    put(JSONObject().apply {
+                        put("smile", f.smilingProbability.toDouble())
+                        put("leftEye", f.leftEyeOpenProbability.toDouble())
+                        put("rightEye", f.rightEyeOpenProbability.toDouble())
+                        put("facing", f.facing.name)
+                    })
+                }
+            })
+
+            // Dominant colors
+            put("colors", JSONArray().apply {
+                m.dominantColors.forEach { put(it) }
+            })
+        }
+    }
+
+    private fun deserializeMetadata(json: JSONObject): PhotoMetadata {
+        val labels = mutableListOf<PhotoLabel>()
+        val labelsArray = json.optJSONArray("labels")
+        if (labelsArray != null) {
+            for (i in 0 until labelsArray.length()) {
+                val l = labelsArray.getJSONObject(i)
+                labels.add(PhotoLabel(l.getString("text"), l.getDouble("confidence").toFloat()))
+            }
+        }
+
+        val objects = mutableListOf<DetectedObject>()
+        val objectsArray = json.optJSONArray("objects")
+        if (objectsArray != null) {
+            for (i in 0 until objectsArray.length()) {
+                val o = objectsArray.getJSONObject(i)
+                val bbox = if (o.has("bbox")) {
+                    val bb = o.getJSONObject("bbox")
+                    BoundingBox(bb.getInt("left"), bb.getInt("top"), bb.getInt("width"), bb.getInt("height"))
+                } else null
+                objects.add(DetectedObject(o.getString("label"), o.getDouble("confidence").toFloat(), bbox))
+            }
+        }
+
+        val faces = mutableListOf<FaceInfo>()
+        val facesArray = json.optJSONArray("faces")
+        if (facesArray != null) {
+            for (i in 0 until facesArray.length()) {
+                val f = facesArray.getJSONObject(i)
+                faces.add(FaceInfo(
+                    smilingProbability = f.getDouble("smile").toFloat(),
+                    leftEyeOpenProbability = f.getDouble("leftEye").toFloat(),
+                    rightEyeOpenProbability = f.getDouble("rightEye").toFloat(),
+                    facing = try { FaceFacing.valueOf(f.getString("facing")) } catch (e: Exception) { FaceFacing.UNKNOWN }
+                ))
+            }
+        }
+
+        val colors = mutableListOf<Int>()
+        val colorsArray = json.optJSONArray("colors")
+        if (colorsArray != null) {
+            for (i in 0 until colorsArray.length()) {
+                colors.add(colorsArray.getInt(i))
+            }
+        }
+
+        return PhotoMetadata(
+            photoId = json.optLong("photoId", 0),
+            labels = labels,
+            detectedObjects = objects,
+            faces = faces,
+            sceneType = try { SceneType.valueOf(json.getString("sceneType")) } catch (e: Exception) { SceneType.UNKNOWN },
+            dominantColors = colors,
+            isOutdoor = if (json.has("isOutdoor") && !json.isNull("isOutdoor")) json.getBoolean("isOutdoor") else null,
+            hasText = json.optBoolean("hasText", false),
+            width = json.optInt("width", 0),
+            height = json.optInt("height", 0),
+            isAnalyzed = json.optBoolean("isAnalyzed", true)
+        )
     }
 }

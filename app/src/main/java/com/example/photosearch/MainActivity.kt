@@ -73,6 +73,7 @@ class MainActivity : ComponentActivity() {
                                 canResume = state.canResume,
                                 savedProgress = state.savedProgress,
                                 savedTotal = state.savedTotal,
+                                searchResultCount = state.searchResultCount,
                                 suggestions = viewModel.getSuggestions(),
                                 ruleDescription = viewModel.getRuleDescription()
                             )

@@ -11,12 +11,8 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.example.photosearch.MainActivity
-import com.example.photosearch.data.AnalysisResultStore
-import com.example.photosearch.data.AppConfig
-import com.example.photosearch.data.PhotoItem
-import com.example.photosearch.data.PhotoLabel
-import com.example.photosearch.data.PhotoRepository
-import com.example.photosearch.ml.ImageAnalyzer
+import com.example.photosearch.data.*
+import com.example.photosearch.ml.EnhancedImageAnalyzer
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -29,14 +25,12 @@ class AnalysisService : Service() {
         const val NOTIFICATION_ID = 1001
         const val ACTION_RESUME = "com.example.photosearch.action.RESUME"
 
-        // Shared state observable from anywhere (ViewModel / Activity)
         private val _analysisState = MutableStateFlow(AnalysisProgress())
         val analysisState = _analysisState.asStateFlow()
 
-        // In-memory cache of analyzed labels (also persisted to disk)
-        val analyzedLabels = mutableMapOf<Long, List<PhotoLabel>>()
+        // In-memory cache of analyzed metadata (also persisted to disk)
+        val analyzedMetadata = mutableMapOf<Long, PhotoMetadata>()
 
-        // All photos loaded by the service
         var allPhotos: List<PhotoItem> = emptyList()
             private set
 
@@ -44,7 +38,7 @@ class AnalysisService : Service() {
 
         fun reset() {
             _analysisState.value = AnalysisProgress()
-            analyzedLabels.clear()
+            analyzedMetadata.clear()
             allPhotos = emptyList()
         }
     }
@@ -58,7 +52,7 @@ class AnalysisService : Service() {
     )
 
     private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    private var analyzer: ImageAnalyzer? = null
+    private var analyzer: EnhancedImageAnalyzer? = null
     private lateinit var resultStore: AnalysisResultStore
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -85,11 +79,10 @@ class AnalysisService : Service() {
 
     private suspend fun runAnalysis() {
         val repository = PhotoRepository(applicationContext)
-        analyzer = ImageAnalyzer(applicationContext)
+        analyzer = EnhancedImageAnalyzer(applicationContext)
         val segmentSize = AppConfig.getSegmentSize(applicationContext)
 
         try {
-            // Load photos
             updateState(isRunning = true, progress = 0, total = 0)
             val photos = repository.loadAllPhotos()
             allPhotos = photos
@@ -106,15 +99,12 @@ class AnalysisService : Service() {
             val isResumed: Boolean
 
             if (saved != null && !saved.isComplete && saved.totalPhotos == photos.size) {
-                // Resume from saved progress
-                analyzedLabels.putAll(saved.results)
+                analyzedMetadata.putAll(saved.metadataMap)
                 startIndex = saved.analyzedCount
                 isResumed = true
                 updateNotification("恢复分析 ${startIndex} / ${photos.size}", startIndex, photos.size)
             } else {
-                // Fresh start
                 if (saved != null && saved.totalPhotos != photos.size) {
-                    // Photo count changed, clear old results
                     resultStore.clear()
                 }
                 startIndex = 0
@@ -125,13 +115,11 @@ class AnalysisService : Service() {
 
             val processedCount = AtomicInteger(startIndex)
 
-            // Process in configurable segments
             var segmentStart = startIndex
             while (segmentStart < photos.size) {
                 val segmentEnd = minOf(segmentStart + segmentSize, photos.size)
                 val segment = photos.subList(segmentStart, segmentEnd)
 
-                // Process this segment in smaller batches for UI updates
                 val batchSize = 3
                 val totalBatches = (segment.size + batchSize - 1) / batchSize
 
@@ -141,12 +129,12 @@ class AnalysisService : Service() {
                     val batch = segment.subList(batchStart, batchEnd)
 
                     val results = batch.map { photo ->
-                        val labels = analyzer!!.analyzePhoto(photo.uri, applicationContext)
-                        photo.id to labels
+                        val metadata = analyzer!!.analyzePhoto(photo.uri, applicationContext)
+                        photo.id to metadata.copy(photoId = photo.id)
                     }
 
-                    results.forEach { (id, labels) ->
-                        analyzedLabels[id] = labels
+                    results.forEach { (id, metadata) ->
+                        analyzedMetadata[id] = metadata
                     }
 
                     val current = processedCount.addAndGet(batch.size)
@@ -159,12 +147,12 @@ class AnalysisService : Service() {
                     updateNotification("正在分析照片 $current / ${photos.size}", current, photos.size)
                 }
 
-                // Save progress after each segment completes
+                // Save progress after each segment
                 resultStore.saveSegment(
                     totalPhotos = photos.size,
                     analyzedCount = segmentEnd,
                     isComplete = segmentEnd >= photos.size,
-                    results = analyzedLabels.toMap()
+                    metadataMap = analyzedMetadata.toMap()
                 )
 
                 segmentStart = segmentEnd
@@ -175,13 +163,12 @@ class AnalysisService : Service() {
 
         } catch (e: Exception) {
             e.printStackTrace()
-            // Save progress even on error so we can resume
-            if (analyzedLabels.isNotEmpty() && allPhotos.isNotEmpty()) {
+            if (analyzedMetadata.isNotEmpty() && allPhotos.isNotEmpty()) {
                 resultStore.saveSegment(
                     totalPhotos = allPhotos.size,
-                    analyzedCount = analyzedLabels.size,
+                    analyzedCount = analyzedMetadata.size,
                     isComplete = false,
-                    results = analyzedLabels.toMap()
+                    metadataMap = analyzedMetadata.toMap()
                 )
             }
             updateState(isRunning = false, isComplete = false)
