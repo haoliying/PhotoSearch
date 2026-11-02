@@ -68,6 +68,11 @@ class MainActivity : ComponentActivity() {
                                 onSearch = { viewModel.search(it) },
                                 onPhotoClick = { viewModel.selectPhoto(it) },
                                 onStartAnalysis = { viewModel.startAnalysis() },
+                                onResumeAnalysis = { viewModel.startAnalysis() },
+                                onRestartAnalysis = { viewModel.restartAnalysis() },
+                                canResume = state.canResume,
+                                savedProgress = state.savedProgress,
+                                savedTotal = state.savedTotal,
                                 suggestions = viewModel.getSuggestions(),
                                 ruleDescription = viewModel.getRuleDescription()
                             )

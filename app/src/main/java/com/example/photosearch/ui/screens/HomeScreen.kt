@@ -12,6 +12,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -40,6 +42,11 @@ fun HomeScreen(
     onSearch: (String) -> Unit,
     onPhotoClick: (PhotoItem) -> Unit,
     onStartAnalysis: () -> Unit,
+    onResumeAnalysis: () -> Unit,
+    onRestartAnalysis: () -> Unit,
+    canResume: Boolean,
+    savedProgress: Int,
+    savedTotal: Int,
     suggestions: List<String>,
     ruleDescription: String?
 ) {
@@ -89,7 +96,12 @@ fun HomeScreen(
                 progress = analysisProgress,
                 total = analysisTotal,
                 photoCount = photos.size,
-                onStartAnalysis = onStartAnalysis
+                onStartAnalysis = onStartAnalysis,
+                onResumeAnalysis = onResumeAnalysis,
+                onRestartAnalysis = onRestartAnalysis,
+                canResume = canResume,
+                savedProgress = savedProgress,
+                savedTotal = savedTotal
             )
 
             // Photo count
@@ -200,7 +212,12 @@ private fun AnalysisSection(
     progress: Int,
     total: Int,
     photoCount: Int,
-    onStartAnalysis: () -> Unit
+    onStartAnalysis: () -> Unit,
+    onResumeAnalysis: () -> Unit,
+    onRestartAnalysis: () -> Unit,
+    canResume: Boolean,
+    savedProgress: Int,
+    savedTotal: Int
 ) {
     Card(
         modifier = Modifier
@@ -230,6 +247,42 @@ private fun AnalysisSection(
                         color = OnSurface.copy(alpha = 0.6f)
                     )
                 }
+                canResume -> {
+                    // Has saved partial progress - offer resume or restart
+                    Text(
+                        "上次分析中断，已保存进度",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = OnSurface.copy(alpha = 0.7f)
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        "已完成 $savedProgress / $savedTotal",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Primary
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = onRestartAnalysis,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("重新分析")
+                        }
+                        Button(
+                            onClick = onResumeAnalysis,
+                            colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("继续分析")
+                        }
+                    }
+                }
                 !hasAnalyzed && photoCount > 0 -> {
                     Text(
                         "首次使用需要分析照片内容",
@@ -239,7 +292,8 @@ private fun AnalysisSection(
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(
                         onClick = onStartAnalysis,
-                        colors = ButtonDefaults.buttonColors(containerColor = Primary)
+                        colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                        shape = RoundedCornerShape(8.dp)
                     ) {
                         Icon(Icons.Default.PhotoLibrary, null)
                         Spacer(modifier = Modifier.width(8.dp))
