@@ -35,7 +35,7 @@ object AppConfig {
     }
 
     fun getApiProvider(context: Context): String {
-        return prefs(context).getString(KEY_API_PROVIDER, "gemini") ?: "gemini"
+        return prefs(context).getString(KEY_API_PROVIDER, "zhipu") ?: "zhipu"
     }
 
     fun setApiProvider(context: Context, provider: String) {

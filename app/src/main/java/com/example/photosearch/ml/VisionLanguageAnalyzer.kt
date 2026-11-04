@@ -6,7 +6,6 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Base64
 import com.example.photosearch.data.AppConfig
-import com.example.photosearch.data.PhotoMetadata
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -16,16 +15,13 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * Vision-Language Model analyzer that uses cloud VLM APIs to generate
- * rich, detailed descriptions of photos for accurate semantic search.
+ * Vision-Language Model analyzer using cloud VLM APIs.
  *
- * Supported providers:
- * - Google Gemini (gemini-2.0-flash / gemini-1.5-flash) — free tier available
- * - OpenAI GPT-4o — requires paid API key
- *
- * The analyzer sends each photo to the VLM with a structured prompt,
- * receives a detailed Chinese description + keywords, and stores them
- * in PhotoMetadata for search.
+ * 支持的国内免费 API（均兼容 OpenAI 格式）：
+ * - 智谱AI (glm-4v-flash) — 完全免费
+ * - 阿里通义千问 (qwen-vl-plus) — 有免费额度
+ * - DeepSeek (deepseek-chat) — 有免费额度
+ * - 硅基流动 (Qwen/Qwen2-VL-7B-Instruct) — 有免费额度
  */
 class VisionLanguageAnalyzer(private val context: Context) {
 
@@ -34,6 +30,57 @@ class VisionLanguageAnalyzer(private val context: Context) {
         private const val READ_TIMEOUT = 60_000
         private const val MAX_IMAGE_SIZE = 1024
         private const val JPEG_QUALITY = 80
+
+        /**
+         * Provider configurations: displayName, apiUrl, modelName, apiKeyUrl
+         */
+        data class ProviderConfig(
+            val id: String,
+            val displayName: String,
+            val apiUrl: String,
+            val modelName: String,
+            val apiKeyUrl: String,
+            val freeInfo: String
+        )
+
+        val PROVIDERS = listOf(
+            ProviderConfig(
+                id = "zhipu",
+                displayName = "智谱AI (免费)",
+                apiUrl = "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                modelName = "glm-4v-flash",
+                apiKeyUrl = "https://open.bigmodel.cn/usercenter/apikeys",
+                freeInfo = "注册即送免费额度，glm-4v-flash 完全免费"
+            ),
+            ProviderConfig(
+                id = "dashscope",
+                displayName = "通义千问 (免费额度)",
+                apiUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+                modelName = "qwen-vl-plus",
+                apiKeyUrl = "https://dashscope.console.aliyun.com/apiKey",
+                freeInfo = "阿里云账号开通后有免费 token 额度"
+            ),
+            ProviderConfig(
+                id = "deepseek",
+                displayName = "DeepSeek (免费额度)",
+                apiUrl = "https://api.deepseek.com/chat/completions",
+                modelName = "deepseek-chat",
+                apiKeyUrl = "https://platform.deepseek.com/api_keys",
+                freeInfo = "注册后有免费额度"
+            ),
+            ProviderConfig(
+                id = "siliconflow",
+                displayName = "硅基流动 (免费额度)",
+                apiUrl = "https://api.siliconflow.cn/v1/chat/completions",
+                modelName = "Qwen/Qwen2-VL-7B-Instruct",
+                apiKeyUrl = "https://cloud.siliconflow.cn/account/ak",
+                freeInfo = "注册后有免费额度，支持多种开源模型"
+            )
+        )
+
+        fun getProviderConfig(providerId: String): ProviderConfig {
+            return PROVIDERS.find { it.id == providerId } ?: PROVIDERS[0]
+        }
     }
 
     data class VlmResult(
@@ -43,12 +90,9 @@ class VisionLanguageAnalyzer(private val context: Context) {
         val error: String? = null
     )
 
-    /**
-     * Analyze a photo using the configured VLM API.
-     */
     suspend fun analyzePhoto(uri: Uri): VlmResult {
         return withContext(Dispatchers.IO) {
-            val provider = AppConfig.getApiProvider(context)
+            val providerId = AppConfig.getApiProvider(context)
             val apiKey = AppConfig.getApiKey(context)
 
             if (apiKey.isBlank()) {
@@ -56,15 +100,13 @@ class VisionLanguageAnalyzer(private val context: Context) {
             }
 
             try {
-                val bitmap = loadAndResizeBitmap(uri) ?: return@withContext VlmResult("", emptyList(), false, "无法加载图片")
+                val bitmap = loadAndResizeBitmap(uri)
+                    ?: return@withContext VlmResult("", emptyList(), false, "无法加载图片")
                 val base64Image = bitmapToBase64(bitmap)
                 if (!bitmap.isRecycled) bitmap.recycle()
 
-                when (provider) {
-                    "gemini" -> analyzeWithGemini(apiKey, base64Image)
-                    "openai" -> analyzeWithOpenAI(apiKey, base64Image)
-                    else -> VlmResult("", emptyList(), false, "不支持的 API 提供商: $provider")
-                }
+                val config = getProviderConfig(providerId)
+                analyzeWithOpenAICompatible(config, apiKey, base64Image)
             } catch (e: Exception) {
                 e.printStackTrace()
                 VlmResult("", emptyList(), false, "分析失败: ${e.message}")
@@ -73,60 +115,18 @@ class VisionLanguageAnalyzer(private val context: Context) {
     }
 
     /**
-     * Call Google Gemini API for image understanding.
+     * Unified OpenAI-compatible API call.
+     * All supported Chinese providers use this format.
      */
-    private fun analyzeWithGemini(apiKey: String, base64Image: String): VlmResult {
-        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$apiKey")
+    private fun analyzeWithOpenAICompatible(
+        config: ProviderConfig,
+        apiKey: String,
+        base64Image: String
+    ): VlmResult {
+        val url = URL(config.apiUrl)
 
         val requestBody = JSONObject().apply {
-            put("contents", JSONArray().put(JSONObject().apply {
-                put("parts", JSONArray()
-                    .put(JSONObject().apply {
-                        put("text", ANALYSIS_PROMPT)
-                    })
-                    .put(JSONObject().apply {
-                        put("inline_data", JSONObject().apply {
-                            put("mime_type", "image/jpeg")
-                            put("data", base64Image)
-                        })
-                    })
-                )
-            }))
-            put("generationConfig", JSONObject().apply {
-                put("temperature", 0.1)
-                put("maxOutputTokens", 1024)
-            })
-        }
-
-        val connection = (url.openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            doOutput = true
-            connectTimeout = CONNECT_TIMEOUT
-            readTimeout = READ_TIMEOUT
-            setRequestProperty("Content-Type", "application/json")
-        }
-
-        connection.outputStream.use { it.write(requestBody.toString().toByteArray()) }
-
-        val responseCode = connection.responseCode
-        val responseBody = if (responseCode == 200) {
-            connection.inputStream.bufferedReader().readText()
-        } else {
-            val error = connection.errorStream?.bufferedReader()?.readText() ?: "Unknown error"
-            return VlmResult("", emptyList(), false, "Gemini API 错误 ($responseCode): $error")
-        }
-
-        return parseGeminiResponse(responseBody)
-    }
-
-    /**
-     * Call OpenAI GPT-4o API for image understanding.
-     */
-    private fun analyzeWithOpenAI(apiKey: String, base64Image: String): VlmResult {
-        val url = URL("https://api.openai.com/v1/chat/completions")
-
-        val requestBody = JSONObject().apply {
-            put("model", "gpt-4o")
+            put("model", config.modelName)
             put("max_tokens", 1024)
             put("temperature", 0.1)
             put("messages", JSONArray().put(JSONObject().apply {
@@ -162,65 +162,59 @@ class VisionLanguageAnalyzer(private val context: Context) {
             connection.inputStream.bufferedReader().readText()
         } else {
             val error = connection.errorStream?.bufferedReader()?.readText() ?: "Unknown error"
-            return VlmResult("", emptyList(), false, "OpenAI API 错误 ($responseCode): $error")
+            return VlmResult("", emptyList(), false,
+                "${config.displayName} API 错误 ($responseCode): $error")
         }
 
-        return parseOpenAIResponse(responseBody)
+        return parseResponse(responseBody, config.displayName)
     }
 
-    private fun parseGeminiResponse(responseBody: String): VlmResult {
+    private fun parseResponse(responseBody: String, providerName: String): VlmResult {
         return try {
             val json = JSONObject(responseBody)
-            val candidates = json.optJSONArray("candidates")
-            if (candidates == null || candidates.length() == 0) {
-                return VlmResult("", emptyList(), false, "Gemini 返回为空")
+
+            // Check for error
+            if (json.has("error")) {
+                val error = json.getJSONObject("error")
+                val msg = error.optString("message", "未知错误")
+                return VlmResult("", emptyList(), false, "$providerName: $msg")
             }
-            val text = candidates.getJSONObject(0)
-                .optJSONObject("content")
-                ?.optJSONArray("parts")
-                ?.optJSONObject(0)
-                ?.optString("text") ?: ""
 
-            parseVlmText(text)
-        } catch (e: Exception) {
-            VlmResult("", emptyList(), false, "解析 Gemini 响应失败: ${e.message}")
-        }
-    }
-
-    private fun parseOpenAIResponse(responseBody: String): VlmResult {
-        return try {
-            val json = JSONObject(responseBody)
             val choices = json.optJSONArray("choices")
             if (choices == null || choices.length() == 0) {
-                return VlmResult("", emptyList(), false, "OpenAI 返回为空")
+                return VlmResult("", emptyList(), false, "$providerName 返回为空")
             }
+
             val text = choices.getJSONObject(0)
                 .optJSONObject("message")
                 ?.optString("content") ?: ""
 
+            if (text.isBlank()) {
+                return VlmResult("", emptyList(), false, "$providerName 返回内容为空")
+            }
+
             parseVlmText(text)
         } catch (e: Exception) {
-            VlmResult("", emptyList(), false, "解析 OpenAI 响应失败: ${e.message}")
+            VlmResult("", emptyList(), false, "解析 $providerName 响应失败: ${e.message}")
         }
     }
 
-    /**
-     * Parse the VLM text response into structured description + keywords.
-     * Expected format:
-     *   描述: [detailed Chinese description]
-     *   关键词: [keyword1], [keyword2], ...
-     */
     private fun parseVlmText(text: String): VlmResult {
-        val cleaned = text.trim().removePrefix("```").removeSuffix("```").trim()
+        val cleaned = text.trim()
+            .removePrefix("```").removeSuffix("```").trim()
 
         var description = ""
         var keywords = listOf<String>()
 
-        // Try structured format first
-        val descMatch = Regex("描述[：:]\\s*(.+?)(?=\\n(?:关键词|标签|关键字)[：:]|$)", RegexOption.DOT_MATCHES_ALL)
-            .find(cleaned)
-        val kwMatch = Regex("(?:关键词|标签|关键字)[：:]\\s*(.+?)(?=\\n|$)", RegexOption.DOT_MATCHES_ALL)
-            .find(cleaned)
+        // Try structured format: 描述: ... 关键词: ...
+        val descMatch = Regex(
+            "描述[：:]\\s*(.+?)(?=\\n(?:关键词|标签|关键字)[：:]|$)",
+            RegexOption.DOT_MATCHES_ALL
+        ).find(cleaned)
+        val kwMatch = Regex(
+            "(?:关键词|标签|关键字)[：:]\\s*(.+?)(?=\\n|$)",
+            RegexOption.DOT_MATCHES_ALL
+        ).find(cleaned)
 
         if (descMatch != null) {
             description = descMatch.groupValues[1].trim()
@@ -245,13 +239,9 @@ class VisionLanguageAnalyzer(private val context: Context) {
         return VlmResult(description, keywords, true)
     }
 
-    /**
-     * Extract meaningful keywords from a Chinese description.
-     */
     private fun extractKeywordsFromDescription(desc: String): List<String> {
         val keywords = mutableSetOf<String>()
 
-        // Common object/scene patterns in Chinese
         val patterns = listOf(
             "汽车", "轿车", "卡车", "公交车", "摩托车", "自行车", "车辆",
             "山", "泰山", "山峰", "山顶", "登山", "爬山",
@@ -281,7 +271,6 @@ class VisionLanguageAnalyzer(private val context: Context) {
             }
         }
 
-        // Check for shirtless / bare chest
         if (desc.contains("光膀子") || desc.contains("赤裸上身") || desc.contains("没穿上衣") ||
             desc.contains("光着上身") || desc.contains("裸露上身") || desc.contains("赤膊")) {
             keywords.add("光膀子")
@@ -297,10 +286,14 @@ class VisionLanguageAnalyzer(private val context: Context) {
                 BitmapFactory.decodeStream(inputStream, null, options)
                 inputStream.close()
 
-                val sampleSize = calculateSampleSize(options.outWidth, options.outHeight, MAX_IMAGE_SIZE)
+                val sampleSize = calculateSampleSize(
+                    options.outWidth, options.outHeight, MAX_IMAGE_SIZE
+                )
 
                 context.contentResolver.openInputStream(uri)?.use { stream ->
-                    val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                    val decodeOptions = BitmapFactory.Options().apply {
+                        inSampleSize = sampleSize
+                    }
                     BitmapFactory.decodeStream(stream, null, decodeOptions)
                 }
             }

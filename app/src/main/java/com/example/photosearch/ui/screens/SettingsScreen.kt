@@ -15,6 +15,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.photosearch.data.AppConfig
+import com.example.photosearch.ml.VisionLanguageAnalyzer
 import com.example.photosearch.ui.theme.*
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -28,6 +29,9 @@ fun SettingsScreen(
     var vlmEnabled by remember { mutableStateOf(AppConfig.isVlmEnabled(context)) }
     var segmentSize by remember { mutableStateOf(AppConfig.getSegmentSize(context).toString()) }
     var saved by remember { mutableStateOf(false) }
+
+    val providers = VisionLanguageAnalyzer.PROVIDERS
+    val selectedProvider = providers.find { it.id == apiProvider } ?: providers[0]
 
     Scaffold(
         topBar = {
@@ -78,7 +82,7 @@ fun SettingsScreen(
                                 fontWeight = FontWeight.Medium
                             )
                             Text(
-                                text = "使用大语言模型（如 Gemini/GPT-4o）分析照片内容，大幅提升搜索准确度",
+                                text = "使用大语言模型分析照片内容，大幅提升搜索准确度",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = OnSurface.copy(alpha = 0.6f)
                             )
@@ -96,40 +100,54 @@ fun SettingsScreen(
 
                         // Provider selection
                         Text(
-                            text = "AI 服务提供商",
+                            text = "选择 AI 服务",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Medium
                         )
                         Spacer(modifier = Modifier.height(8.dp))
 
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FilterChip(
-                                selected = apiProvider == "gemini",
-                                onClick = { apiProvider = "gemini" },
-                                label = { Text("Google Gemini") }
-                            )
-                            FilterChip(
-                                selected = apiProvider == "openai",
-                                onClick = { apiProvider = "openai" },
-                                label = { Text("OpenAI GPT-4o") }
-                            )
+                        // Provider chips in a column for readability
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            providers.forEach { provider ->
+                                FilterChip(
+                                    selected = apiProvider == provider.id,
+                                    onClick = {
+                                        apiProvider = provider.id
+                                        saved = false
+                                    },
+                                    label = {
+                                        Text(
+                                            text = provider.displayName,
+                                            fontSize = if (apiProvider == provider.id)
+                                                MaterialTheme.typography.bodyMedium.fontSize
+                                                else MaterialTheme.typography.bodySmall.fontSize
+                                        )
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
                         }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        // Show selected provider info
+                        Text(
+                            text = selectedProvider.freeInfo,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Primary,
+                            fontWeight = FontWeight.Medium
+                        )
 
                         Spacer(modifier = Modifier.height(16.dp))
 
                         // API Key input
                         OutlinedTextField(
                             value = apiKey,
-                            onValueChange = { apiKey = it },
-                            label = { Text("API Key") },
-                            placeholder = {
-                                Text(
-                                    if (apiProvider == "gemini")
-                                        "输入 Google Gemini API Key"
-                                    else
-                                        "输入 OpenAI API Key"
-                                )
+                            onValueChange = {
+                                apiKey = it
+                                saved = false
                             },
+                            label = { Text("API Key") },
+                            placeholder = { Text("粘贴你的 API Key") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(8.dp)
@@ -137,11 +155,7 @@ fun SettingsScreen(
 
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = when (apiProvider) {
-                                "gemini" -> "获取免费 Key: https://aistudio.google.com/apikey"
-                                "openai" -> "获取 Key: https://platform.openai.com/api-keys"
-                                else -> ""
-                            },
+                            text = "获取 API Key: ${selectedProvider.apiKeyUrl}",
                             style = MaterialTheme.typography.bodySmall,
                             color = Primary
                         )
@@ -201,7 +215,7 @@ fun SettingsScreen(
                 colors = ButtonDefaults.buttonColors(containerColor = Primary),
                 shape = RoundedCornerShape(8.dp)
             ) {
-                Text(if (saved) "已保存" else "保存设置")
+                Text(if (saved) "已保存 ✓" else "保存设置")
             }
 
             // Info section
@@ -218,14 +232,21 @@ fun SettingsScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "智能相册搜索 v3.0",
+                        text = "智能相册搜索 v3.1",
                         style = MaterialTheme.typography.bodyMedium
                     )
+                    Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "使用 Google ML Kit 进行本地图像识别，结合云端大语言模型（Gemini/GPT-4o）生成丰富的中文照片描述，实现高精度自然语言搜索。",
+                        text = "使用 ML Kit 本地图像识别 + 云端大语言模型生成中文照片描述，实现高精度自然语言搜索。",
                         style = MaterialTheme.typography.bodySmall,
-                        color = OnSurface.copy(alpha = 0.6f),
-                        modifier = Modifier.padding(top = 4.dp)
+                        color = OnSurface.copy(alpha = 0.6f)
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "推荐：智谱AI 的 glm-4v-flash 模型完全免费，适合日常使用。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Secondary,
+                        fontWeight = FontWeight.Medium
                     )
                 }
             }
