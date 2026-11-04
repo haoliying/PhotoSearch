@@ -13,11 +13,15 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
 import com.example.photosearch.ui.screens.HomeScreen
 import com.example.photosearch.ui.screens.PhotoDetailScreen
+import com.example.photosearch.ui.screens.SettingsScreen
 import com.example.photosearch.ui.theme.PhotoSearchTheme
 import com.example.photosearch.viewmodel.PhotoViewModel
 
@@ -47,8 +51,15 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.background
                 ) {
                     val state by viewModel.state.collectAsState()
+                    var showSettings by remember { mutableStateOf(false) }
 
                     when {
+                        showSettings -> {
+                            SettingsScreen(
+                                context = this@MainActivity,
+                                onBack = { showSettings = false }
+                            )
+                        }
                         state.selectedPhoto != null -> {
                             PhotoDetailScreen(
                                 photo = state.selectedPhoto!!,
@@ -75,7 +86,8 @@ class MainActivity : ComponentActivity() {
                                 savedTotal = state.savedTotal,
                                 searchResultCount = state.searchResultCount,
                                 suggestions = viewModel.getSuggestions(),
-                                ruleDescription = viewModel.getRuleDescription()
+                                ruleDescription = viewModel.getRuleDescription(),
+                                onSettingsClick = { showSettings = true }
                             )
                         }
                     }

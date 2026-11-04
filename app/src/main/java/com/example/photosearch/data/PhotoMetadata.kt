@@ -24,7 +24,11 @@ data class PhotoMetadata(
     val width: Int = 0,
     val height: Int = 0,
     // Whether analysis is complete
-    val isAnalyzed: Boolean = false
+    val isAnalyzed: Boolean = false,
+    // VLM-generated rich description (Chinese)
+    val description: String = "",
+    // VLM-generated structured keywords
+    val vlmKeywords: List<String> = emptyList()
 )
 
 data class DetectedObject(
@@ -75,6 +79,18 @@ enum class SceneType {
  */
 fun PhotoMetadata.toSearchableTags(): Set<String> {
     val tags = mutableSetOf<String>()
+
+    // VLM description is the most valuable search signal
+    if (description.isNotBlank()) {
+        tags.add(description.lowercase())
+        // Also add individual phrases from description
+        description.split(Regex("[，。、；！？,\\.\\s]+"))
+            .filter { it.length >= 2 }
+            .forEach { tags.add(it.lowercase()) }
+    }
+
+    // VLM structured keywords
+    vlmKeywords.forEach { tags.add(it.lowercase()) }
 
     // Add all labels (both English and common Chinese translations)
     labels.forEach { label ->

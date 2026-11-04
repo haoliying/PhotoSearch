@@ -99,6 +99,48 @@ fun PhotoDetailScreen(
                         Divider()
                         Spacer(modifier = Modifier.height(12.dp))
 
+                        // VLM description (highest priority info)
+                        if (metadata.description.isNotBlank()) {
+                            Text(
+                                text = "AI 描述",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Primary
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = metadata.description,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = OnSurface
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // VLM keywords
+                            if (metadata.vlmKeywords.isNotEmpty()) {
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    metadata.vlmKeywords.forEach { kw ->
+                                        Surface(
+                                            shape = RoundedCornerShape(12.dp),
+                                            color = Primary.copy(alpha = 0.1f)
+                                        ) {
+                                            Text(
+                                                text = kw,
+                                                fontSize = 12.sp,
+                                                color = Primary,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(12.dp))
+                            }
+                            Divider()
+                            Spacer(modifier = Modifier.height(12.dp))
+                        }
+
                         // Scene type
                         if (metadata.sceneType != SceneType.UNKNOWN) {
                             InfoRow("场景类型", sceneTypeName(metadata.sceneType))

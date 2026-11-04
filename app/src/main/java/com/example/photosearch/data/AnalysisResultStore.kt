@@ -120,6 +120,12 @@ class AnalysisResultStore(context: Context) {
             put("width", m.width)
             put("height", m.height)
             put("isAnalyzed", m.isAnalyzed)
+            put("description", m.description)
+
+            // VLM keywords
+            put("vlmKeywords", JSONArray().apply {
+                m.vlmKeywords.forEach { put(it) }
+            })
 
             // Labels
             put("labels", JSONArray().apply {
@@ -213,6 +219,14 @@ class AnalysisResultStore(context: Context) {
             }
         }
 
+        val vlmKeywords = mutableListOf<String>()
+        val vlmKeywordsArray = json.optJSONArray("vlmKeywords")
+        if (vlmKeywordsArray != null) {
+            for (i in 0 until vlmKeywordsArray.length()) {
+                vlmKeywords.add(vlmKeywordsArray.getString(i))
+            }
+        }
+
         return PhotoMetadata(
             photoId = json.optLong("photoId", 0),
             labels = labels,
@@ -224,7 +238,9 @@ class AnalysisResultStore(context: Context) {
             hasText = json.optBoolean("hasText", false),
             width = json.optInt("width", 0),
             height = json.optInt("height", 0),
-            isAnalyzed = json.optBoolean("isAnalyzed", true)
+            isAnalyzed = json.optBoolean("isAnalyzed", true),
+            description = json.optString("description", ""),
+            vlmKeywords = vlmKeywords
         )
     }
 }

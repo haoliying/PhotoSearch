@@ -15,6 +15,7 @@ import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -49,7 +50,8 @@ fun HomeScreen(
     savedTotal: Int,
     searchResultCount: Int,
     suggestions: List<String>,
-    ruleDescription: String?
+    ruleDescription: String?,
+    onSettingsClick: () -> Unit = {}
 ) {
     var showSearchBar by remember { mutableStateOf(false) }
 
@@ -69,6 +71,9 @@ fun HomeScreen(
                 actions = {
                     IconButton(onClick = { showSearchBar = !showSearchBar }) {
                         Icon(Icons.Default.Search, "搜索", tint = Color.White)
+                    }
+                    IconButton(onClick = onSettingsClick) {
+                        Icon(Icons.Default.Settings, "设置", tint = Color.White)
                     }
                 }
             )
