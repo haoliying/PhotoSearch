@@ -435,7 +435,7 @@ private fun AnalysisSection(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.Center
                     ) {
-                        Icon(Icons.Default.Search, null, tint = Secondary, modifier = Modifier.size(18.dp))
+                        Icon(Icons.Default.CheckCircle, null, tint = Secondary, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
                             "分析完成，可以搜索照片内容",
