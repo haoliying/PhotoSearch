@@ -37,7 +37,13 @@ data class PhotoSearchState(
     val searchResultCount: Int = 0,
     val searchDescription: String? = null,
     val reanalyzingPhoto: Boolean = false,
-    val reanalyzeError: String? = null
+    val reanalyzeError: String? = null,
+    // Multi-select for batch re-analyze
+    val selectionMode: Boolean = false,
+    val selectedIds: Set<Long> = emptySet(),
+    val batchReanalyzing: Boolean = false,
+    val batchProgress: Int = 0,
+    val batchTotal: Int = 0
 )
 
 class PhotoViewModel(application: Application) : AndroidViewModel(application) {
@@ -338,4 +344,126 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
     fun getSuggestions(): List<String> = IntentParser.getSuggestions()
 
     fun getRuleDescription(): String? = _state.value.searchDescription
+
+    // --- Multi-select for batch re-analyze ---
+
+    fun enterSelectionMode() {
+        _state.value = _state.value.copy(selectionMode = true, selectedIds = emptySet())
+    }
+
+    fun exitSelectionMode() {
+        _state.value = _state.value.copy(selectionMode = false, selectedIds = emptySet())
+    }
+
+    fun togglePhotoSelection(photoId: Long) {
+        val current = _state.value.selectedIds.toMutableSet()
+        if (current.contains(photoId) ) {
+            current.remove(photoId)
+            if (current.isEmpty()) {
+                _state.value = _state.value.copy(selectionMode = false, selectedIds = emptySet())
+                return
+            }
+        } else {
+            current.add(photoId)
+        }
+        _state.value = _state.value.copy(selectedIds = current)
+    }
+
+    fun selectAllFiltered() {
+        val ids = _state.value.filteredPhotos.map { it.id }.toSet()
+        _state.value = _state.value.copy(selectionMode = true, selectedIds = ids)
+    }
+
+    fun reanalyzeSelectedPhotos() {
+        val ids = _state.value.selectedIds.toList()
+        if (ids.isEmpty() || _state.value.batchReanalyzing) return
+
+        exitSelectionMode()
+        viewModelScope.launch {
+            _state.value = _state.value.copy(
+                batchReanalyzing = true,
+                batchProgress = 0,
+                batchTotal = ids.size
+            )
+
+            val context = getApplication<Application>()
+            val useVlm = AppConfig.isVlmEnabled(context) && AppConfig.hasApiKey(context)
+            val analyzer = EnhancedImageAnalyzer(context)
+            val vlmAnalyzer = if (useVlm) VisionLanguageAnalyzer(context) else null
+
+            try {
+                for ((index, photoId) in ids.withIndex()) {
+                    val photo = _state.value.allPhotos.find { it.id == photoId } ?: continue
+
+                    try {
+                        val onDeviceMetadata = withContext(Dispatchers.IO) {
+                            analyzer.analyzePhoto(photo.uri, context)
+                        }
+
+                        var description = ""
+                        var vlmKeywords = listOf<String>()
+                        if (vlmAnalyzer != null) {
+                            try {
+                                val vlmResult = vlmAnalyzer.analyzePhoto(photo.uri)
+                                if (vlmResult.success) {
+                                    description = vlmResult.description
+                                    vlmKeywords = vlmResult.keywords
+                                }
+                            } catch (_: Exception) { }
+                        }
+
+                        val metadata = onDeviceMetadata.copy(
+                            photoId = photo.id,
+                            description = description,
+                            vlmKeywords = vlmKeywords
+                        )
+
+                        metadataCache[photo.id] = metadata
+                        AnalysisService.analyzedMetadata[photo.id] = metadata
+
+                        val updatedPhoto = photo.copy(
+                            labels = metadata.labels,
+                            metadata = metadata,
+                            isAnalyzed = true
+                        )
+
+                        _state.value = _state.value.copy(
+                            allPhotos = _state.value.allPhotos.map {
+                                if (it.id == photo.id) updatedPhoto else it
+                            },
+                            filteredPhotos = _state.value.filteredPhotos.map {
+                                if (it.id == photo.id) updatedPhoto else it
+                            },
+                            batchProgress = index + 1
+                        )
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        _state.value = _state.value.copy(batchProgress = index + 1)
+                    }
+                }
+
+                withContext(Dispatchers.IO) {
+                    resultStore.saveSegment(
+                        totalPhotos = _state.value.allPhotos.size,
+                        analyzedCount = metadataCache.size,
+                        isComplete = _state.value.allPhotos.all { metadataCache.containsKey(it.id) },
+                        metadataMap = metadataCache.toMap()
+                    )
+                }
+
+                _state.value = _state.value.copy(hasAnalyzed = true)
+
+                if (_state.value.searchQuery.isNotBlank()) {
+                    search(_state.value.searchQuery)
+                }
+            } finally {
+                analyzer.close()
+                _state.value = _state.value.copy(
+                    batchReanalyzing = false,
+                    batchProgress = 0,
+                    batchTotal = 0
+                )
+            }
+        }
+    }
 }

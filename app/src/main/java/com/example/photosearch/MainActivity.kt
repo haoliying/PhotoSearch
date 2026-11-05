@@ -90,7 +90,17 @@ class MainActivity : ComponentActivity() {
                                 searchResultCount = state.searchResultCount,
                                 suggestions = viewModel.getSuggestions(),
                                 ruleDescription = viewModel.getRuleDescription(),
-                                onSettingsClick = { showSettings = true }
+                                onSettingsClick = { showSettings = true },
+                                selectionMode = state.selectionMode,
+                                selectedIds = state.selectedIds,
+                                batchReanalyzing = state.batchReanalyzing,
+                                batchProgress = state.batchProgress,
+                                batchTotal = state.batchTotal,
+                                onEnterSelection = { viewModel.enterSelectionMode() },
+                                onExitSelection = { viewModel.exitSelectionMode() },
+                                onToggleSelection = { viewModel.togglePhotoSelection(it) },
+                                onSelectAll = { viewModel.selectAllFiltered() },
+                                onBatchReanalyze = { viewModel.reanalyzeSelectedPhotos() }
                             )
                         }
                     }

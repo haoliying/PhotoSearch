@@ -1,7 +1,9 @@
 package com.example.photosearch.ui.screens
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -11,11 +13,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.PhotoLibrary
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -23,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -51,32 +50,102 @@ fun HomeScreen(
     searchResultCount: Int,
     suggestions: List<String>,
     ruleDescription: String?,
-    onSettingsClick: () -> Unit = {}
+    onSettingsClick: () -> Unit = {},
+    // Multi-select
+    selectionMode: Boolean = false,
+    selectedIds: Set<Long> = emptySet(),
+    batchReanalyzing: Boolean = false,
+    batchProgress: Int = 0,
+    batchTotal: Int = 0,
+    onEnterSelection: () -> Unit = {},
+    onExitSelection: () -> Unit = {},
+    onToggleSelection: (Long) -> Unit = {},
+    onSelectAll: () -> Unit = {},
+    onBatchReanalyze: () -> Unit = {}
 ) {
     var showSearchBar by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Text(
-                        "智能相册搜索",
-                        style = MaterialTheme.typography.titleLarge,
-                        color = Color.White
+            if (selectionMode) {
+                // Selection mode top bar
+                TopAppBar(
+                    title = {
+                        Text(
+                            "已选择 ${selectedIds.size} 张",
+                            style = MaterialTheme.typography.titleLarge,
+                            color = Color.White
+                        )
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = onExitSelection) {
+                            Icon(Icons.Default.Close, "取消", tint = Color.White)
+                        }
+                    },
+                    actions = {
+                        IconButton(onClick = onSelectAll) {
+                            Icon(Icons.Default.SelectAll, "全选", tint = Color.White)
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = Primary
                     )
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = Primary
-                ),
-                actions = {
-                    IconButton(onClick = { showSearchBar = !showSearchBar }) {
-                        Icon(Icons.Default.Search, "搜索", tint = Color.White)
+                )
+            } else {
+                TopAppBar(
+                    title = {
+                        Text(
+                            "智能相册搜索",
+                            style = MaterialTheme.typography.titleLarge,
+                            color = Color.White
+                        )
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = Primary
+                    ),
+                    actions = {
+                        IconButton(onClick = { showSearchBar = !showSearchBar }) {
+                            Icon(Icons.Default.Search, "搜索", tint = Color.White)
+                        }
+                        IconButton(onClick = onSettingsClick) {
+                            Icon(Icons.Default.Settings, "设置", tint = Color.White)
+                        }
                     }
-                    IconButton(onClick = onSettingsClick) {
-                        Icon(Icons.Default.Settings, "设置", tint = Color.White)
+                )
+            }
+        },
+        bottomBar = {
+            if (selectionMode && selectedIds.isNotEmpty()) {
+                // Bottom action bar for selection mode
+                Surface(
+                    shadowElevation = 8.dp,
+                    color = Surface
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "长按照片可多选",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = OnSurface.copy(alpha = 0.5f)
+                        )
+                        Button(
+                            onClick = onBatchReanalyze,
+                            enabled = !batchReanalyzing,
+                            colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("重新分析 (${selectedIds.size})")
+                        }
                     }
                 }
-            )
+            }
         }
     ) { padding ->
         Column(
@@ -85,8 +154,40 @@ fun HomeScreen(
                 .padding(padding)
                 .background(Background)
         ) {
+            // Batch re-analyze progress
+            if (batchReanalyzing) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Surface)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            "正在重新分析照片…",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        LinearProgressIndicator(
+                            progress = if (batchTotal > 0) batchProgress.toFloat() / batchTotal else 0f,
+                            modifier = Modifier.fillMaxWidth(),
+                            color = Primary,
+                            trackColor = ProgressTrack,
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "$batchProgress / $batchTotal",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = OnSurface.copy(alpha = 0.6f)
+                        )
+                    }
+                }
+            }
+
             // Search section
-            if (showSearchBar || searchQuery.isNotBlank()) {
+            if (!selectionMode && (showSearchBar || searchQuery.isNotBlank())) {
                 SearchSection(
                     query = searchQuery,
                     onQueryChange = onSearch,
@@ -96,31 +197,52 @@ fun HomeScreen(
             }
 
             // Analysis section
-            AnalysisSection(
-                isAnalyzing = isAnalyzing,
-                hasAnalyzed = hasAnalyzed,
-                progress = analysisProgress,
-                total = analysisTotal,
-                photoCount = photos.size,
-                onStartAnalysis = onStartAnalysis,
-                onResumeAnalysis = onResumeAnalysis,
-                onRestartAnalysis = onRestartAnalysis,
-                canResume = canResume,
-                savedProgress = savedProgress,
-                savedTotal = savedTotal
-            )
+            if (!selectionMode) {
+                AnalysisSection(
+                    isAnalyzing = isAnalyzing,
+                    hasAnalyzed = hasAnalyzed,
+                    progress = analysisProgress,
+                    total = analysisTotal,
+                    photoCount = photos.size,
+                    onStartAnalysis = onStartAnalysis,
+                    onResumeAnalysis = onResumeAnalysis,
+                    onRestartAnalysis = onRestartAnalysis,
+                    canResume = canResume,
+                    savedProgress = savedProgress,
+                    savedTotal = savedTotal
+                )
+            }
 
             // Photo count
-            if (!isLoading) {
-                Text(
-                    text = when {
-                        searchQuery.isNotBlank() -> "找到 ${searchResultCount} 张匹配照片"
-                        else -> "共 ${photos.size} 张照片"
-                    },
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = OnSurface.copy(alpha = 0.7f)
-                )
+            if (!isLoading && !selectionMode) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = when {
+                            searchQuery.isNotBlank() -> "找到 ${searchResultCount} 张匹配照片"
+                            else -> "共 ${photos.size} 张照片"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = OnSurface.copy(alpha = 0.7f)
+                    )
+                    if (hasAnalyzed && photos.isNotEmpty()) {
+                        TextButton(onClick = onEnterSelection) {
+                            Icon(
+                                Icons.Default.Checklist,
+                                null,
+                                modifier = Modifier.size(18.dp),
+                                tint = Primary
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("选择重分析", color = Primary)
+                        }
+                    }
+                }
             }
 
             // Content
@@ -140,7 +262,14 @@ fun HomeScreen(
                     EmptyState(message = "相册中没有照片")
                 }
                 else -> {
-                    PhotoGrid(photos = photos, onPhotoClick = onPhotoClick)
+                    PhotoGrid(
+                        photos = photos,
+                        selectionMode = selectionMode,
+                        selectedIds = selectedIds,
+                        onPhotoClick = onPhotoClick,
+                        onPhotoLongClick = { onEnterSelection(); onToggleSelection(it.id) },
+                        onPhotoSelect = onToggleSelection
+                    )
                 }
             }
         }
@@ -181,7 +310,6 @@ private fun SearchSection(
                 )
             }
 
-            // Suggestion chips
             if (query.isBlank()) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
@@ -253,7 +381,6 @@ private fun AnalysisSection(
                     )
                 }
                 canResume -> {
-                    // Has saved partial progress - offer resume or restart
                     Text(
                         "上次分析中断，已保存进度",
                         style = MaterialTheme.typography.bodyMedium,
@@ -266,9 +393,7 @@ private fun AnalysisSection(
                         color = Primary
                     )
                     Spacer(modifier = Modifier.height(12.dp))
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
                             onClick = onRestartAnalysis,
                             shape = RoundedCornerShape(8.dp)
@@ -310,12 +435,7 @@ private fun AnalysisSection(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.Center
                     ) {
-                        Icon(
-                            Icons.Default.Search,
-                            null,
-                            tint = Secondary,
-                            modifier = Modifier.size(18.dp)
-                        )
+                        Icon(Icons.Default.Search, null, tint = Secondary, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
                             "分析完成，可以搜索照片内容",
@@ -352,10 +472,15 @@ private fun EmptyState(message: String) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PhotoGrid(
     photos: List<PhotoItem>,
-    onPhotoClick: (PhotoItem) -> Unit
+    selectionMode: Boolean,
+    selectedIds: Set<Long>,
+    onPhotoClick: (PhotoItem) -> Unit,
+    onPhotoLongClick: (PhotoItem) -> Unit,
+    onPhotoSelect: (Long) -> Unit
 ) {
     LazyVerticalGrid(
         columns = GridCells.Adaptive(110.dp),
@@ -365,22 +490,46 @@ private fun PhotoGrid(
         modifier = Modifier.fillMaxSize()
     ) {
         gridItems(photos, key = { it.id }) { photo ->
-            PhotoThumbnail(photo = photo, onClick = { onPhotoClick(photo) })
+            PhotoThumbnail(
+                photo = photo,
+                selectionMode = selectionMode,
+                isSelected = selectedIds.contains(photo.id),
+                onClick = {
+                    if (selectionMode) {
+                        onPhotoSelect(photo.id)
+                    } else {
+                        onPhotoClick(photo)
+                    }
+                },
+                onLongClick = { onPhotoLongClick(photo) }
+            )
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PhotoThumbnail(
     photo: PhotoItem,
-    onClick: () -> Unit
+    selectionMode: Boolean,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
 ) {
     Card(
         modifier = Modifier
             .aspectRatio(1f)
-            .clickable(onClick = onClick),
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
         shape = RoundedCornerShape(8.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+        elevation = CardDefaults.cardElevation(
+            defaultElevation = if (isSelected) 4.dp else 1.dp
+        ),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected) Primary.copy(alpha = 0.15f) else Color.White
+        )
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             AsyncImage(
@@ -390,8 +539,30 @@ private fun PhotoThumbnail(
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Show analysis indicator
-            if (photo.isAnalyzed && photo.labels.isNotEmpty()) {
+            // Selection checkbox overlay
+            if (selectionMode) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(4.dp)
+                        .size(24.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (isSelected) Primary else Color.White.copy(alpha = 0.8f)
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (isSelected) {
+                        Icon(
+                            Icons.Default.Check,
+                            null,
+                            tint = Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            } else if (photo.isAnalyzed && photo.labels.isNotEmpty()) {
+                // Analysis indicator (only in normal mode)
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
