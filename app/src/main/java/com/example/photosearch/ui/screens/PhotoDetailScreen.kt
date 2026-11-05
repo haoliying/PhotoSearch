@@ -7,6 +7,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -31,7 +32,10 @@ import java.util.*
 fun PhotoDetailScreen(
     photo: PhotoItem,
     onBack: () -> Unit,
-    onShare: () -> Unit
+    onShare: () -> Unit,
+    onReanalyze: () -> Unit = {},
+    isReanalyzing: Boolean = false,
+    reanalyzeError: String? = null
 ) {
     Scaffold(
         topBar = {
@@ -252,6 +256,37 @@ fun PhotoDetailScreen(
                         Icon(Icons.Default.Share, null)
                         Spacer(modifier = Modifier.width(8.dp))
                         Text("分享此照片")
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = onReanalyze,
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !isReanalyzing,
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        if (isReanalyzing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = Primary
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("正在重新分析…")
+                        } else {
+                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("重新分析此照片")
+                        }
+                    }
+
+                    if (reanalyzeError != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = reanalyzeError,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
                     }
                 }
             }

@@ -7,7 +7,9 @@ import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.photosearch.data.*
+import com.example.photosearch.ml.EnhancedImageAnalyzer
 import com.example.photosearch.ml.SearchConditionMapper
+import com.example.photosearch.ml.VisionLanguageAnalyzer
 import com.example.photosearch.search.IntentParser
 import com.example.photosearch.search.SearchEngine
 import com.example.photosearch.service.AnalysisService
@@ -33,7 +35,9 @@ data class PhotoSearchState(
     val savedProgress: Int = 0,
     val savedTotal: Int = 0,
     val searchResultCount: Int = 0,
-    val searchDescription: String? = null
+    val searchDescription: String? = null,
+    val reanalyzingPhoto: Boolean = false,
+    val reanalyzeError: String? = null
 )
 
 class PhotoViewModel(application: Application) : AndroidViewModel(application) {
@@ -184,6 +188,96 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
             )
 
             startAnalysis()
+        }
+    }
+
+    /**
+     * Re-analyze a single photo (on-device + VLM if enabled).
+     */
+    fun reanalyzePhoto(photo: PhotoItem) {
+        if (_state.value.reanalyzingPhoto) return
+
+        viewModelScope.launch {
+            _state.value = _state.value.copy(reanalyzingPhoto = true, reanalyzeError = null)
+
+            try {
+                val context = getApplication<Application>()
+                val useVlm = AppConfig.isVlmEnabled(context) && AppConfig.hasApiKey(context)
+
+                // On-device analysis
+                val analyzer = EnhancedImageAnalyzer(context)
+                val onDeviceMetadata = withContext(Dispatchers.IO) {
+                    analyzer.analyzePhoto(photo.uri, context)
+                }
+                analyzer.close()
+
+                // VLM analysis (if enabled)
+                var description = ""
+                var vlmKeywords = listOf<String>()
+                if (useVlm) {
+                    try {
+                        val vlmAnalyzer = VisionLanguageAnalyzer(context)
+                        val vlmResult = vlmAnalyzer.analyzePhoto(photo.uri)
+                        if (vlmResult.success) {
+                            description = vlmResult.description
+                            vlmKeywords = vlmResult.keywords
+                        } else {
+                            _state.value = _state.value.copy(
+                                reanalyzeError = "VLM 分析失败: ${vlmResult.error}"
+                            )
+                        }
+                    } catch (e: Exception) {
+                        _state.value = _state.value.copy(
+                            reanalyzeError = "VLM 分析异常: ${e.message}"
+                        )
+                    }
+                }
+
+                // Build final metadata
+                val metadata = onDeviceMetadata.copy(
+                    photoId = photo.id,
+                    description = description,
+                    vlmKeywords = vlmKeywords
+                )
+
+                // Update cache
+                metadataCache[photo.id] = metadata
+                AnalysisService.analyzedMetadata[photo.id] = metadata
+
+                // Save to disk
+                withContext(Dispatchers.IO) {
+                    resultStore.saveSegment(
+                        totalPhotos = _state.value.allPhotos.size,
+                        analyzedCount = metadataCache.size,
+                        isComplete = _state.value.allPhotos.all { metadataCache.containsKey(it.id) },
+                        metadataMap = metadataCache.toMap()
+                    )
+                }
+
+                // Update the photo in state
+                val updatedPhoto = photo.copy(
+                    labels = metadata.labels,
+                    metadata = metadata,
+                    isAnalyzed = true
+                )
+
+                _state.value = _state.value.copy(
+                    selectedPhoto = updatedPhoto,
+                    allPhotos = _state.value.allPhotos.map {
+                        if (it.id == photo.id) updatedPhoto else it
+                    },
+                    filteredPhotos = _state.value.filteredPhotos.map {
+                        if (it.id == photo.id) updatedPhoto else it
+                    },
+                    hasAnalyzed = true,
+                    reanalyzingPhoto = false
+                )
+            } catch (e: Exception) {
+                _state.value = _state.value.copy(
+                    reanalyzingPhoto = false,
+                    reanalyzeError = "重新分析失败: ${e.message}"
+                )
+            }
         }
     }
 

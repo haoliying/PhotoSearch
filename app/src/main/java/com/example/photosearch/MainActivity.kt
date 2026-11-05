@@ -64,7 +64,10 @@ class MainActivity : ComponentActivity() {
                             PhotoDetailScreen(
                                 photo = state.selectedPhoto!!,
                                 onBack = { viewModel.selectPhoto(null) },
-                                onShare = { sharePhoto(state.selectedPhoto!!) }
+                                onShare = { sharePhoto(state.selectedPhoto!!) },
+                                onReanalyze = { viewModel.reanalyzePhoto(state.selectedPhoto!!) },
+                                isReanalyzing = state.reanalyzingPhoto,
+                                reanalyzeError = state.reanalyzeError
                             )
                         }
                         else -> {
