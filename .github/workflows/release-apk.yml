@@ -1,0 +1,96 @@
+name: Build & Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag, e.g. v3.5.0'
+        required: true
+        default: 'v3.5.0'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Resolve version tag
+        id: ver
+        run: echo "tag=${{ inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure Android SDK 34
+        run: |
+          SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKMGR" ]; then
+            yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+            "$SDKMGR" "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
+          fi
+          echo "ANDROID_HOME=$ANDROID_HOME"
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build unsigned release APK
+        run: |
+          [ -f app/proguard-rules.pro ] || touch app/proguard-rules.pro
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Decode release keystore
+        env:
+          PS_KEYSTORE_BASE64: ${{ secrets.PS_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$PS_KEYSTORE_BASE64" || { echo "secret PS_KEYSTORE_BASE64 is empty"; exit 1; }
+          echo "$PS_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/photosearch.jks"
+          test -s "$RUNNER_TEMP/photosearch.jks"
+          ls -l "$RUNNER_TEMP/photosearch.jks"
+
+      - name: Align and sign APK
+        env:
+          PS_KEYSTORE_PASSWORD: ${{ secrets.PS_KEYSTORE_PASSWORD }}
+          PS_KEY_ALIAS: ${{ secrets.PS_KEY_ALIAS }}
+          PS_KEY_PASSWORD: ${{ secrets.PS_KEY_PASSWORD }}
+        run: |
+          set -e
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "using build-tools: $BT"
+          UNSIGNED=$(find app/build/outputs/apk/release -name '*unsigned*.apk' | head -1)
+          if [ -z "$UNSIGNED" ]; then
+            echo 'unsigned APK not found'; find app/build/outputs -type f | head -40; exit 1
+          fi
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$RUNNER_TEMP/photosearch.jks" \
+            --ks-key-alias "$PS_KEY_ALIAS" \
+            --ks-pass "pass:$PS_KEYSTORE_PASSWORD" \
+            --key-pass "pass:$PS_KEY_PASSWORD" \
+            --v1-signing-enabled true --v2-signing-enabled true \
+            --out "PhotoSearch-${{ steps.ver.outputs.tag }}.apk" \
+            "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --verbose "PhotoSearch-${{ steps.ver.outputs.tag }}.apk"
+          ls -lh "PhotoSearch-${{ steps.ver.outputs.tag }}.apk"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -e
+          gh release create "$TAG" "PhotoSearch-$TAG.apk" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "PhotoSearch $TAG" \
+            --notes "修复照片搜索准确度：重写检索层，移除导致任意查询几乎返回整个相册的模糊匹配（fuzzyMatch 2 字符子串、双向 contains、排除条件反向加分等）。离线仿真宏平均精确率 0.10 -> 0.90。APK 已使用固定自签名证书签名，可直接安装；根因与后续优化路线见仓库 docs/SEARCH_ACCURACY.md。"
+          echo "Released $TAG"
