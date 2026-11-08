@@ -51,6 +51,9 @@ fun HomeScreen(
     suggestions: List<String>,
     ruleDescription: String?,
     onSettingsClick: () -> Unit = {},
+    error: String? = null,
+    onReloadPhotos: () -> Unit = {},
+    onClearSearch: () -> Unit = {},
     // Multi-select
     selectionMode: Boolean = false,
     selectedIds: Set<Long> = emptySet(),
@@ -256,10 +259,18 @@ fun HomeScreen(
                     }
                 }
                 photos.isEmpty() && searchQuery.isNotBlank() -> {
-                    EmptyState(message = "未找到匹配的照片")
+                    EmptyState(
+                        message = "未找到匹配的照片",
+                        actionLabel = "清除搜索",
+                        onAction = onClearSearch
+                    )
                 }
                 photos.isEmpty() -> {
-                    EmptyState(message = "相册中没有照片")
+                    EmptyState(
+                        message = error ?: "没有读取到相册照片。请在系统设置 → 权限中允许「照片和视频」（Android 14 请选择「始终允许所有照片」），再点下方按钮重试",
+                        actionLabel = "重新加载照片",
+                        onAction = onReloadPhotos
+                    )
                 }
                 else -> {
                     PhotoGrid(
@@ -450,7 +461,11 @@ private fun AnalysisSection(
 }
 
 @Composable
-private fun EmptyState(message: String) {
+private fun EmptyState(
+    message: String,
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null
+) {
     Box(
         modifier = Modifier.fillMaxSize(),
         contentAlignment = Alignment.Center
@@ -466,8 +481,21 @@ private fun EmptyState(message: String) {
             Text(
                 message,
                 style = MaterialTheme.typography.bodyLarge,
-                color = OnSurface.copy(alpha = 0.5f)
+                color = OnSurface.copy(alpha = 0.5f),
+                modifier = Modifier.padding(horizontal = 32.dp)
             )
+            if (actionLabel != null && onAction != null) {
+                Spacer(modifier = Modifier.height(16.dp))
+                Button(
+                    onClick = { onAction?.invoke() },
+                    colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(actionLabel.orEmpty())
+                }
+            }
         }
     }
 }

@@ -62,8 +62,23 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         observeServiceState()
     }
 
+    /**
+     * 重新扫描相册。用于「照片权限授予后」「从系统设置返回」「用户手动刷新」。
+     * 修复 v3.5.0 缺陷：照片只在 ViewModel init 时加载一次，而权限对话框在其后才弹出，
+     * 首次查询拿到空列表后即使授权也不会再刷新，导致相册一直显示为空。
+     */
+    fun reloadPhotos() {
+        loadPhotos()
+    }
+
+    /** onResume 兜底：仅当列表为空且当前未在加载时重扫，避免每次回前台都查询 MediaStore。 */
+    fun reloadIfEmpty() {
+        if (_state.value.allPhotos.isEmpty() && !_state.value.isLoading) loadPhotos()
+    }
+
     private fun loadPhotos() {
         viewModelScope.launch {
+            if (_state.value.isLoading) return@launch
             _state.value = _state.value.copy(isLoading = true, error = null)
             try {
                 val photos = repository.loadAllPhotos()

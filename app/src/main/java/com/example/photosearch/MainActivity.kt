@@ -31,7 +31,10 @@ class MainActivity : ComponentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* no-op: app handles missing permission gracefully */ }
+    ) { granted ->
+        // 授权成功后必须重新扫描：ViewModel 的首次加载发生在弹框之前，拿到的是空列表
+        if (granted) viewModel.reloadPhotos()
+    }
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -91,6 +94,9 @@ class MainActivity : ComponentActivity() {
                                 suggestions = viewModel.getSuggestions(),
                                 ruleDescription = viewModel.getRuleDescription(),
                                 onSettingsClick = { showSettings = true },
+                                error = state.error,
+                                onReloadPhotos = { viewModel.reloadPhotos() },
+                                onClearSearch = { viewModel.search("") },
                                 selectionMode = state.selectionMode,
                                 selectedIds = state.selectedIds,
                                 batchReanalyzing = state.batchReanalyzing,
@@ -109,15 +115,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestPermissions() {
-        // Photo access permission
-        val photoPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+    override fun onResume() {
+        super.onResume()
+        // 用户可能在系统设置里改过照片权限，或首次授权后返回前台；列表为空时重扫一次
+        if (ContextCompat.checkSelfPermission(this, photoPermission()) == PackageManager.PERMISSION_GRANTED) {
+            viewModel.reloadIfEmpty()
+        }
+    }
+
+    private fun photoPermission(): String =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             Manifest.permission.READ_MEDIA_IMAGES
         } else {
             Manifest.permission.READ_EXTERNAL_STORAGE
         }
-        if (ContextCompat.checkSelfPermission(this, photoPermission) != PackageManager.PERMISSION_GRANTED) {
-            permissionLauncher.launch(photoPermission)
+
+    private fun requestPermissions() {
+        // Photo access permission
+        val perm = photoPermission()
+        if (ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED) {
+            permissionLauncher.launch(perm)
         }
 
         // Notification permission (Android 13+)
