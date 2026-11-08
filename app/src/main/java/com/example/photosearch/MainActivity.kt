@@ -19,6 +19,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
+import com.example.photosearch.ui.SwipeBackContainer
 import com.example.photosearch.ui.screens.HomeScreen
 import com.example.photosearch.ui.screens.PhotoDetailScreen
 import com.example.photosearch.ui.screens.SettingsScreen
@@ -72,22 +73,27 @@ class MainActivity : ComponentActivity() {
 
                     when {
                         showSettings -> {
-                            SettingsScreen(
-                                context = this@MainActivity,
-                                onBack = { showSettings = false }
-                            )
+                            // v3.7.0：右滑 / 系统返回键都回到相册主页
+                            SwipeBackContainer(onBack = { showSettings = false }) {
+                                SettingsScreen(
+                                    context = this@MainActivity,
+                                    onBack = { showSettings = false }
+                                )
+                            }
                         }
                         state.selectedPhoto != null -> {
-                            PhotoDetailScreen(
-                                photo = state.selectedPhoto!!,
-                                onBack = { viewModel.selectPhoto(null) },
-                                onShare = { sharePhoto(state.selectedPhoto!!) },
-                                onReanalyze = { viewModel.reanalyzePhoto(state.selectedPhoto!!) },
-                                isReanalyzing = state.reanalyzingPhoto,
-                                reanalyzeError = state.reanalyzeError,
-                                exif = state.selectedPhoto?.let { state.exifMap[it.id] },
-                                onSetPlaceLabel = { id, label -> viewModel.setPlaceLabel(id, label) }
-                            )
+                            SwipeBackContainer(onBack = { viewModel.selectPhoto(null) }) {
+                                PhotoDetailScreen(
+                                    photo = state.selectedPhoto!!,
+                                    onBack = { viewModel.selectPhoto(null) },
+                                    onShare = { sharePhoto(state.selectedPhoto!!) },
+                                    onReanalyze = { viewModel.reanalyzePhoto(state.selectedPhoto!!) },
+                                    isReanalyzing = state.reanalyzingPhoto,
+                                    reanalyzeError = state.reanalyzeError,
+                                    exif = state.selectedPhoto?.let { state.exifMap[it.id] },
+                                    onSetPlaceLabel = { id, label -> viewModel.setPlaceLabel(id, label) }
+                                )
+                            }
                         }
                         else -> {
                             HomeScreen(
@@ -136,7 +142,8 @@ class MainActivity : ComponentActivity() {
                                 onTimeRangeChange = { viewModel.setTimeRange(it) },
                                 onLocationQueryChange = { viewModel.setLocationQuery(it) },
                                 onSelectPlace = { viewModel.selectPlace(it) },
-                                onClearFilters = { viewModel.clearFilters() }
+                                onClearFilters = { viewModel.clearFilters() },
+                                exifMap = state.exifMap
                             )
                         }
                     }

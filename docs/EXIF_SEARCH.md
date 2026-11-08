@@ -143,3 +143,49 @@
    不纳入时间筛选，界面会提示张数。
 
 回滚：`git revert <commit>` 或安装 v3.5.2（签名相同，可覆盖安装）。
+
+---
+
+## v3.7.0：补齐 EXIF 可提取信息并生成中文标签
+
+v3.6.0 只读了「拍摄时间 + GPS + 地名」。实际上 `androidx.exifinterface`
+还能稳定读出大量拍摄参数，v3.7.0 全部补齐，并统一转成**中文可检索标签**。
+
+### 新增字段与来源
+
+| 类别 | 字段 | EXIF 标签 / 来源 |
+| --- | --- | --- |
+| 设备 | 厂商、型号、镜头厂商/型号、处理软件、作者、图像描述 | `Make` `Model` `LensMake` `LensModel` `LensSpecification` `Software` `Artist` `ImageDescription` |
+| 曝光 | 光圈、快门、ISO、焦距、等效 35mm 焦距、曝光补偿、测光模式 | `FNumber` `ExposureTime` `PhotographicSensitivity` / `ISOSpeedRatings` `FocalLength` `FocalLengthIn35mmFilm` `ExposureBiasValue` `MeteringMode` |
+| 状态 | 闪光灯、白平衡、方向 | `Flash` `WhiteBalance` `Orientation` |
+| 图像 | 像素宽高、色彩、GPS 海拔 | `ImageWidth` `ImageLength` `GPSAltitude` / `GPSAltitudeRef` |
+| 时间 | GPS 日期戳、原始时区偏移 | `GPSDateStamp` `OffsetTimeOriginal` |
+| 文件 | MIME、文件大小、扩展名 | MediaStore `_size` / `mime_type` / `_display_name`（API 29+ 才投影这些列） |
+
+所有 EXIF 标签都用**标准字符串名**访问，避免不同 `exifinterface` 版本的常量差异；
+rational 值（如 `1/125`、`4/1`、`f/1.8`、`-1/3`）统一解析为数值。
+
+### 生成的中文标签（可直接作为搜索词）
+
+| 维度 | 标签示例 |
+| --- | --- |
+| 设备 | 品牌归一中文（苹果 / 华为 / 小米 / 佳能 / 尼康 / 索尼 / 大疆…）、型号、镜头、处理软件 |
+| 格式与画幅 | `JPEG` `PNG` `HEIC` `WEBP` `RAW`、`JPEG格式`、`横幅` / `竖幅` / `方形`、`横图` / `竖图`、`高像素` |
+| 镜头与曝光 | `广角`（≤35mm）、`标准镜头`、`长焦`（≥70mm）、`大光圈`（F≤2.8）、`虚化`、`长曝光` / `慢门`、`高速快门`、`高感光度` / `高ISO`、`已闪光` / `未闪光`、`自动白平衡` |
+| 时间派生 | `2023年` `4月` `2023年4月`、`春季` / `夏季` / `秋季` / `冬季`、`清晨` / `上午` / `中午` / `下午` / `傍晚` / `夜间`、`周末` |
+| 其他 | `高海拔`（≥1500m） |
+
+标签以 0.75 权重编入全文索引（`ConceptRegistry.buildSearchIndex`），
+因此「佳能」「竖幅」「广角」「JPEG」「大光圈」等词可直接命中照片，
+且仍与时间区间、地点、内容词按 AND 联动。
+
+### 缓存升级
+
+`photo_exif.json` 升级到 version 2；v1 旧缓存仍可读取，但
+`PhotoViewModel` 会对 `schemaVersion < 2` 的记录重新提取一次（EXIF 读取不需要 AI，很快），
+并**保留用户手动标注的地点**，升级后不会丢标注。
+
+### 界面
+
+- 详情页新增「拍摄参数与文件信息」键值列表与「可检索标签」中文 chips。
+- 主界面列表视图直接展示拍摄时间、地点、格式、分辨率、文件大小、相机与中文标签。

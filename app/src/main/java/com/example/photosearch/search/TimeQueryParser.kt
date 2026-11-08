@@ -16,6 +16,10 @@ import java.util.TimeZone
  */
 object TimeQueryParser {
 
+    /** v3.7.0：界面上统一使用的日期输入格式说明，避免提示与实际解析能力不一致。 */
+    const val DATE_FORMAT_HINT = "yyyy-MM-dd（例：2023-06-01），也支持 2023年6月1日 / 2023/6/1 / 2023.6.1"
+    const val TIME_QUERY_HINT = "时间写法：2023年6月 · 2023-06-01 到 2023-12-31 · 最近三个月 · 去年夏天 · 国庆"
+
     data class ParseResult(val range: TimeRange?, val remainder: String)
 
     private val DATE_TOKEN = Regex(
@@ -185,17 +189,26 @@ object TimeQueryParser {
         )
     }
 
-    /** 从「yyyy-MM-dd」两个字符串构造区间，起止均为闭区间（内部转成左闭右开）。 */
+    /**
+     * 从两个日期字符串构造区间（起止均为闭区间，内部转成左闭右开）。
+     * v3.7.0：支持 2023-06-01 / 2023年6月1日 / 2023/6/1 / 2023.6.1 / 20230601，
+     * 也支持只写年月（2023-06 / 2023年6月，自动补为该月 1 日到月末）。
+     */
     fun fromDateStrings(start: String, end: String, zone: TimeZone = TimeZone.getDefault()): TimeRange? {
         val s = parseYmd(start) ?: return null
         val e = parseYmd(end) ?: return null
         val sm = startOfDay(s[0], s[1], s[2], zone)
-        val em = shift(startOfDay(e[0], e[1], e[2], zone), Calendar.DAY_OF_YEAR, 1, zone)
+        val em = if (e.size >= 4 && e[3] == 1) {
+            // 只写了年月：整月
+            shift(startOfDay(e[0], e[1], 1, zone), Calendar.MONTH, 1, zone)
+        } else {
+            shift(startOfDay(e[0], e[1], e[2], zone), Calendar.DAY_OF_YEAR, 1, zone)
+        }
         if (sm >= em) return null
-        return TimeRange(sm, em, "$start ~ $end")
+        return TimeRange(sm, em, "${chineseDate(sm, zone)} 至 ${chineseDate(shift(em, Calendar.DAY_OF_YEAR, -1, zone), zone)}")
     }
 
-    /** 把左闭右开区间格式化为闭区间展示。 */
+    /** 把左闭右开区间格式化为闭区间展示（yyyy-MM-dd，供内部/日志使用）。 */
     fun format(range: TimeRange, zone: TimeZone = TimeZone.getDefault()): String {
         val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
         fmt.timeZone = zone
@@ -207,13 +220,46 @@ object TimeQueryParser {
         return "$s ~ $e"
     }
 
+    /**
+     * v3.7.0：界面统一使用的中文时间区间格式，例如
+     * 「2023年6月1日 至 2023年12月31日」「2023年1月1日 至 至今」。
+     */
+    fun formatChinese(range: TimeRange, zone: TimeZone = TimeZone.getDefault()): String {
+        val s = if (range.startMillis <= 0L) "最早" else chineseDate(range.startMillis, zone)
+        val e = if (range.endExclusive >= TimeRange.NO_UPPER) "至今" else {
+            chineseDate(shift(range.endExclusive, Calendar.DAY_OF_YEAR, -1, zone), zone)
+        }
+        return "$s 至 $e"
+    }
+
+    /**
+     * 界面展示用的时间条件文本：快捷标签（今年 / 最近30天 / 去年夏天）优先，
+     * 其余一律输出统一的中文日期区间，避免混用 `2023-01-01 ~ 2023-12-31`
+     * 与 `2023年6月` 两种格式。
+     */
+    fun displayLabel(range: TimeRange, zone: TimeZone = TimeZone.getDefault()): String {
+        val l = range.label
+        return if (l.isNotBlank() && !l.contains('~') && !l.contains("至")) l
+        else formatChinese(range, zone)
+    }
+
+    private fun chineseDate(millis: Long, zone: TimeZone): String {
+        val c = Calendar.getInstance(zone).apply { timeInMillis = millis }
+        return "${c.get(Calendar.YEAR)}年${c.get(Calendar.MONTH) + 1}月${c.get(Calendar.DAY_OF_MONTH)}日"
+    }
+
     // ------------------------------------------------------------------
     // 内部工具
     // ------------------------------------------------------------------
 
-    private fun cut(text: String, from: Int, to: Int): String =
-        (text.substring(0, from) + " " + text.substring(to))
+    private fun cut(text: String, from: Int, to: Int): String {
+        val joined = (text.substring(0, from) + " " + text.substring(to))
             .replace(Regex("""\s+"""), " ").trim()
+        // 「2023年在北京拍的汽车」里 DATE_TOKEN 只吃到 2023，残留的「年」
+        // 不是内容词，清掉以免污染剩余文本的分词。
+        return joined.replace(Regex("""(?:^|\s)年(?=\s|[^\d\s])"""), " ")
+            .replace(Regex("""\s+"""), " ").trim()
+    }
 
     private fun dateStart(m: MatchResult, zone: TimeZone): Long? {
         val y = m.groupValues[1].toIntOrNull() ?: return null
@@ -302,13 +348,36 @@ object TimeQueryParser {
         return (total + current).toDouble()
     }
 
+    /** 返回 [年, 月, 日]，或 [年, 月, 1, 1] 表示「只写了年月、按整月处理」。 */
     private fun parseYmd(text: String): IntArray? {
-        val m = Regex("""^\s*(\d{4})\s*[年/\-.]\s*(\d{1,2})\s*[月/\-.]\s*(\d{1,2})\s*日?\s*$""").find(text)
-            ?: return null
-        val y = m.groupValues[1].toIntOrNull() ?: return null
-        val mo = m.groupValues[2].toIntOrNull() ?: return null
-        val d = m.groupValues[3].toIntOrNull() ?: return null
-        if (y !in 1900..2100 || mo !in 1..12 || d !in 1..31) return null
-        return intArrayOf(y, mo, d)
+        val s = text.trim()
+
+        // 完整日期：2023-06-01 / 2023年6月1日 / 2023/6/1 / 2023.6.1
+        val full = Regex("""^(\d{4})\s*[年/\-.]\s*(\d{1,2})\s*[月/\-.]\s*(\d{1,2})\s*日?$""").find(s)
+        if (full != null) {
+            val y = full.groupValues[1].toIntOrNull() ?: return null
+            val mo = full.groupValues[2].toIntOrNull() ?: return null
+            val d = full.groupValues[3].toIntOrNull() ?: return null
+            return if (y in 1900..2100 && mo in 1..12 && d in 1..31) intArrayOf(y, mo, d) else null
+        }
+
+        // 紧凑格式：20230601
+        val compact = Regex("""^((?:19|20)\d{2})(\d{2})(\d{2})$""")
+            .find(s.replace(Regex("""\s"""), ""))
+        if (compact != null) {
+            val y = compact.groupValues[1].toInt()
+            val mo = compact.groupValues[2].toInt()
+            val d = compact.groupValues[3].toInt()
+            return if (mo in 1..12 && d in 1..31) intArrayOf(y, mo, d) else null
+        }
+
+        // 只写年月：2023-06 / 2023年6月 / 2023/6 → 整月
+        val ym = Regex("""^(\d{4})\s*[年/\-.]\s*(\d{1,2})\s*月?$""").find(s)
+        if (ym != null) {
+            val y = ym.groupValues[1].toIntOrNull() ?: return null
+            val mo = ym.groupValues[2].toIntOrNull() ?: return null
+            return if (y in 1900..2100 && mo in 1..12) intArrayOf(y, mo, 1, 1) else null
+        }
+        return null
     }
 }

@@ -144,7 +144,12 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         if (_state.value.isExtractingExif) return
         viewModelScope.launch {
             val cached = withContext(Dispatchers.IO) { exifStore.load() }
-            val need = photos.filterNot { cached.containsKey(it.id) }
+            // v3.7.0：旧缓存（schema 1）缺少拍摄参数，重新提取一次以补齐中文标签；
+            // 重新提取时保留用户手动标注的地点，避免升级后标注丢失。
+            val need = photos.filter { p ->
+                val e = cached[p.id]
+                e == null || !e.hasExtendedInfo
+            }
             exifCache = cached
             _state.value = _state.value.copy(
                 exifMap = exifCache.toMap(),
@@ -159,7 +164,11 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                 withContext(Dispatchers.IO) {
                     need.forEachIndexed { i, p ->
                         try {
-                            exifCache[p.id] = ExifReader.read(app, p)
+                            val fresh = ExifReader.read(app, p)
+                            val old = cached[p.id]
+                            exifCache[p.id] = if (old != null && old.manualLabel.isNotBlank()) {
+                                ExifReader.withManualLabel(fresh, p.id, old.manualLabel)
+                            } else fresh
                         } catch (_: Exception) {
                             exifCache[p.id] = PhotoExif(
                                 photoId = p.id,
@@ -247,7 +256,7 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
 
         val results = SearchEngine.search(intent, st.allPhotos, metadataCache, st.exifMap)
         val pieces = mutableListOf<String>()
-        time?.let { pieces += "时间 ${it.label.ifBlank { TimeQueryParser.format(it) }}" }
+        time?.let { pieces += "时间 ${TimeQueryParser.displayLabel(it)}" }
         loc?.let { pieces += "地点 ${it.raw}" }
         val summary = pieces.joinToString(" · ").takeIf { it.isNotBlank() }
 

@@ -2,13 +2,13 @@ package com.example.photosearch.ui.screens
 
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items as gridItems
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -16,6 +16,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -26,14 +27,29 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.example.photosearch.data.PhotoExif
 import com.example.photosearch.data.PhotoItem
+import com.example.photosearch.data.chineseDisplayTags
 import com.example.photosearch.search.LocationQuery
 import com.example.photosearch.search.PlaceCatalog
 import com.example.photosearch.search.PlaceSuggestion
 import com.example.photosearch.search.TimeQueryParser
 import com.example.photosearch.search.TimeRange
 import com.example.photosearch.ui.theme.*
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
+/**
+ * v3.7.0 主界面重构。
+ *
+ * 旧版把「搜索卡片 + 筛选卡片 + 分析卡片 + 计数行」四块常驻堆叠，
+ * 照片只剩屏幕底部一小块。本版的原则：
+ *  1. 照片是主体：所有查询条件默认收起，顶部只保留一行图标；
+ *  2. 条件可见但不占地：生效时只显示一条摘要栏，点开才展开完整面板；
+ *  3. 两种视图：网格（纯缩略图）/ 列表（缩略图 + 时间、地点、格式等 EXIF 信息）；
+ *  4. 分析入口收成一条细状态条，完成即隐藏，不再常驻大卡片。
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
@@ -83,26 +99,26 @@ fun HomeScreen(
     onTimeRangeChange: (TimeRange?) -> Unit = {},
     onLocationQueryChange: (LocationQuery?) -> Unit = {},
     onSelectPlace: (PlaceSuggestion) -> Unit = {},
-    onClearFilters: () -> Unit = {}
+    onClearFilters: () -> Unit = {},
+    // v3.7.0：列表视图展示 EXIF 信息
+    exifMap: Map<Long, PhotoExif> = emptyMap()
 ) {
-    var showSearchBar by remember { mutableStateOf(false) }
-    var showFilters by remember { mutableStateOf(false) }
+    var showSearch by rememberSaveable { mutableStateOf(false) }
+    var showFilters by rememberSaveable { mutableStateOf(false) }
+    var listMode by rememberSaveable { mutableStateOf(false) }
+    var showOverflow by remember { mutableStateOf(false) }
+
+    val hasQuery = searchQuery.isNotBlank()
+    val hasConditions = hasQuery || filterSummary != null
 
     Scaffold(
         topBar = {
             if (selectionMode) {
-                // Selection mode top bar
                 TopAppBar(
-                    title = {
-                        Text(
-                            "已选择 ${selectedIds.size} 张",
-                            style = MaterialTheme.typography.titleLarge,
-                            color = Color.White
-                        )
-                    },
+                    title = { Text("已选择 ${selectedIds.size} 张", color = Color.White) },
                     navigationIcon = {
                         IconButton(onClick = onExitSelection) {
-                            Icon(Icons.Default.Close, "取消", tint = Color.White)
+                            Icon(Icons.Default.Close, "取消多选", tint = Color.White)
                         }
                     },
                     actions = {
@@ -110,35 +126,77 @@ fun HomeScreen(
                             Icon(Icons.Default.SelectAll, "全选", tint = Color.White)
                         }
                     },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = Primary
-                    )
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Primary)
                 )
             } else {
                 TopAppBar(
                     title = {
-                        Text(
-                            "智能相册搜索",
-                            style = MaterialTheme.typography.titleLarge,
-                            color = Color.White
-                        )
+                        Column {
+                            Text("智能相册搜索", color = Color.White, style = MaterialTheme.typography.titleMedium)
+                            if (!isLoading) {
+                                Text(
+                                    when {
+                                        hasConditions -> "$searchResultCount 张结果"
+                                        else -> "共 ${photos.size} 张照片"
+                                    },
+                                    color = Color.White.copy(alpha = 0.75f),
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
                     },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = Primary
-                    ),
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Primary),
                     actions = {
-                        IconButton(onClick = { showFilters = !showFilters }) {
+                        IconButton(onClick = { showSearch = !showSearch; showFilters = false }) {
                             Icon(
-                                Icons.Default.FilterList,
-                                "时间与地点筛选",
+                                if (showSearch) Icons.Default.Close else Icons.Default.Search,
+                                "搜索", tint = if (hasQuery) Secondary else Color.White
+                            )
+                        }
+                        IconButton(onClick = { showFilters = !showFilters; showSearch = false }) {
+                            Icon(
+                                Icons.Default.Tune, "时间与地点筛选",
                                 tint = if (filterSummary != null) Secondary else Color.White
                             )
                         }
-                        IconButton(onClick = { showSearchBar = !showSearchBar }) {
-                            Icon(Icons.Default.Search, "搜索", tint = Color.White)
+                        IconButton(onClick = { listMode = !listMode }) {
+                            Icon(
+                                if (listMode) Icons.Default.Apps else Icons.Default.List,
+                                if (listMode) "切换为缩略图" else "切换为列表",
+                                tint = Color.White
+                            )
                         }
-                        IconButton(onClick = onSettingsClick) {
-                            Icon(Icons.Default.Settings, "设置", tint = Color.White)
+                        Box {
+                            IconButton(onClick = { showOverflow = true }) {
+                                Icon(Icons.Default.MoreVert, "更多", tint = Color.White)
+                            }
+                            DropdownMenu(
+                                expanded = showOverflow,
+                                onDismissRequest = { showOverflow = false }
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("设置（API / 模型）") },
+                                    leadingIcon = { Icon(Icons.Default.Settings, null) },
+                                    onClick = { showOverflow = false; onSettingsClick() }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("重新分析全部") },
+                                    leadingIcon = { Icon(Icons.Default.Refresh, null) },
+                                    onClick = { showOverflow = false; onRestartAnalysis() }
+                                )
+                                if (hasAnalyzed && photos.isNotEmpty()) {
+                                    DropdownMenuItem(
+                                        text = { Text("多选照片重新分析") },
+                                        leadingIcon = { Icon(Icons.Default.Checklist, null) },
+                                        onClick = { showOverflow = false; onEnterSelection() }
+                                    )
+                                }
+                                DropdownMenuItem(
+                                    text = { Text("重新加载相册") },
+                                    leadingIcon = { Icon(Icons.Default.PhotoLibrary, null) },
+                                    onClick = { showOverflow = false; onReloadPhotos() }
+                                )
+                            }
                         }
                     }
                 )
@@ -146,89 +204,59 @@ fun HomeScreen(
         },
         bottomBar = {
             if (selectionMode && selectedIds.isNotEmpty()) {
-                // Bottom action bar for selection mode
-                Surface(
-                    shadowElevation = 8.dp,
-                    color = Surface
-                ) {
+                Surface(shadowElevation = 8.dp, color = Surface) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "长按照片可多选",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = OnSurface.copy(alpha = 0.5f)
-                        )
+                        Text("已选 ${selectedIds.size} 张", style = MaterialTheme.typography.bodySmall,
+                            color = OnSurface.copy(alpha = 0.6f))
                         Button(
                             onClick = onBatchReanalyze,
                             enabled = !batchReanalyzing,
                             colors = ButtonDefaults.buttonColors(containerColor = Primary),
                             shape = RoundedCornerShape(8.dp)
-                        ) {
-                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("重新分析 (${selectedIds.size})")
-                        }
+                        ) { Text("重新分析") }
                     }
                 }
             }
         }
     ) { padding ->
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .background(Background)
+            modifier = Modifier.fillMaxSize().padding(padding).background(Background)
         ) {
-            // Batch re-analyze progress
             if (batchReanalyzing) {
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(12.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = CardDefaults.cardColors(containerColor = Surface)
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text(
-                            "正在重新分析照片…",
-                            style = MaterialTheme.typography.bodyLarge,
-                            fontWeight = FontWeight.Medium
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        LinearProgressIndicator(
-                            progress = if (batchTotal > 0) batchProgress.toFloat() / batchTotal else 0f,
-                            modifier = Modifier.fillMaxWidth(),
-                            color = Primary,
-                            trackColor = ProgressTrack,
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            "$batchProgress / $batchTotal",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = OnSurface.copy(alpha = 0.6f)
-                        )
-                    }
-                }
+                ThinProgress("正在重新分析照片…", batchProgress, batchTotal)
             }
 
-            // Search section
-            if (!selectionMode && (showSearchBar || searchQuery.isNotBlank())) {
-                SearchSection(
+            // ---------- 生效条件摘要：只占一行 ----------
+            if (!selectionMode && hasConditions) {
+                ActiveConditionBar(
                     query = searchQuery,
-                    onQueryChange = onSearch,
-                    suggestions = suggestions,
-                    ruleDescription = ruleDescription
+                    filterSummary = filterSummary,
+                    ruleDescription = ruleDescription,
+                    resultCount = searchResultCount,
+                    onExpandSearch = { showSearch = true },
+                    onExpandFilters = { showFilters = true },
+                    onClearAll = { onClearSearch(); onClearFilters(); showSearch = false; showFilters = false }
                 )
             }
 
-            // v3.6.0 时间 / 地点联动筛选
-            if (!selectionMode && (showFilters || filterSummary != null || isExtractingExif)) {
-                FilterSection(
+            // ---------- 搜索面板（点开才出现） ----------
+            if (!selectionMode && showSearch) {
+                SearchPanel(
+                    query = searchQuery,
+                    onQueryChange = onSearch,
+                    suggestions = suggestions,
+                    ruleDescription = ruleDescription,
+                    onClose = { showSearch = false }
+                )
+            }
+
+            // ---------- 时间 / 地点筛选面板（点开才出现） ----------
+            if (!selectionMode && showFilters) {
+                FilterPanel(
                     timeRange = timeRange,
                     locationQuery = locationQuery,
                     availablePlaces = availablePlaces,
@@ -241,96 +269,50 @@ fun HomeScreen(
                     onTimeRangeChange = onTimeRangeChange,
                     onLocationQueryChange = onLocationQueryChange,
                     onSelectPlace = onSelectPlace,
-                    onClearFilters = {
-                        onClearFilters()
-                    }
+                    onClearFilters = onClearFilters,
+                    onClose = { showFilters = false }
                 )
             }
 
-            // Analysis section
+            // ---------- 分析状态：细条，完成即隐藏 ----------
             if (!selectionMode) {
-                AnalysisSection(
+                AnalysisStatusBar(
                     isAnalyzing = isAnalyzing,
                     hasAnalyzed = hasAnalyzed,
                     progress = analysisProgress,
                     total = analysisTotal,
                     photoCount = photos.size,
-                    onStartAnalysis = onStartAnalysis,
-                    onResumeAnalysis = onResumeAnalysis,
-                    onRestartAnalysis = onRestartAnalysis,
                     canResume = canResume,
                     savedProgress = savedProgress,
-                    savedTotal = savedTotal
+                    savedTotal = savedTotal,
+                    isExtractingExif = isExtractingExif,
+                    exifProgress = exifProgress,
+                    exifTotal = exifTotal,
+                    onStartAnalysis = onStartAnalysis,
+                    onResumeAnalysis = onResumeAnalysis,
+                    onRestartAnalysis = onRestartAnalysis
                 )
             }
 
-            // Photo count
-            if (!isLoading && !selectionMode) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = when {
-                            filterSummary != null -> "筛选结果 ${searchResultCount} 张"
-                            searchQuery.isNotBlank() -> "找到 ${searchResultCount} 张匹配照片"
-                            else -> "共 ${photos.size} 张照片"
-                        },
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = OnSurface.copy(alpha = 0.7f)
-                    )
-                    if (hasAnalyzed && photos.isNotEmpty()) {
-                        TextButton(onClick = onEnterSelection) {
-                            Icon(
-                                Icons.Default.Checklist,
-                                null,
-                                modifier = Modifier.size(18.dp),
-                                tint = Primary
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("选择重分析", color = Primary)
-                        }
-                    }
-                }
-            }
-
-            // Content
-            when {
-                isLoading -> {
-                    Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center
-                    ) {
+            // ---------- 照片主体 ----------
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                when {
+                    isLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         CircularProgressIndicator(color = Primary)
                     }
-                }
-                photos.isEmpty() && filterSummary != null -> {
-                    EmptyState(
-                        message = "没有同时满足「$filterSummary」的照片。可以放宽时间区间、换个地点，或清除筛选。",
-                        actionLabel = "清除筛选",
-                        onAction = onClearFilters
+                    photos.isEmpty() && filterSummary != null -> EmptyState(
+                        "没有同时满足「$filterSummary」的照片。可以放宽时间区间、换个地点，或清除筛选。",
+                        "清除筛选", onClearFilters
                     )
-                }
-                photos.isEmpty() && searchQuery.isNotBlank() -> {
-                    EmptyState(
-                        message = "未找到匹配的照片",
-                        actionLabel = "清除搜索",
-                        onAction = onClearSearch
+                    photos.isEmpty() && hasQuery -> EmptyState("未找到匹配的照片", "清除搜索", onClearSearch)
+                    photos.isEmpty() -> EmptyState(
+                        error ?: "没有读取到相册照片。请在系统设置 → 权限中允许「照片和视频」（Android 14 请选择「始终允许所有照片」），再点下方按钮重试",
+                        "重新加载照片", onReloadPhotos
                     )
-                }
-                photos.isEmpty() -> {
-                    EmptyState(
-                        message = error ?: "没有读取到相册照片。请在系统设置 → 权限中允许「照片和视频」（Android 14 请选择「始终允许所有照片」），再点下方按钮重试",
-                        actionLabel = "重新加载照片",
-                        onAction = onReloadPhotos
-                    )
-                }
-                else -> {
-                    PhotoGrid(
+                    else -> PhotoCollection(
                         photos = photos,
+                        listMode = listMode,
+                        exifMap = exifMap,
                         selectionMode = selectionMode,
                         selectedIds = selectedIds,
                         onPhotoClick = onPhotoClick,
@@ -343,15 +325,147 @@ fun HomeScreen(
     }
 }
 
-/**
- * v3.6.0 时间 / 地点联动筛选面板。
- * - 时间：快捷区间 + 自定义起止日期（yyyy-MM-dd）
- * - 地点：模糊输入框 + 从当前时间区间内实际照片统计出的候选地点（可点选）
- * - 两者与搜索词按 AND 联动；时间变化时候选地点自动重算
- */
+// ---------------------------------------------------------------------
+// 顶部条件摘要
+// ---------------------------------------------------------------------
+
+@Composable
+private fun ActiveConditionBar(
+    query: String,
+    filterSummary: String?,
+    ruleDescription: String?,
+    resultCount: Int,
+    onExpandSearch: () -> Unit,
+    onExpandFilters: () -> Unit,
+    onClearAll: () -> Unit
+) {
+    Surface(color = Surface, shadowElevation = 1.dp) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.FilterList, null, tint = Primary, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    buildString {
+                        if (query.isNotBlank()) append("「$query」")
+                        if (filterSummary != null) {
+                            if (isNotEmpty()) append(" · ")
+                            append(filterSummary)
+                        }
+                    }.ifBlank { "当前筛选" },
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = OnSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (ruleDescription != null && query.isNotBlank()) {
+                    Text(ruleDescription, fontSize = 10.sp, color = Primary,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            Text("$resultCount 张", fontSize = 11.sp, color = OnSurface.copy(alpha = 0.6f))
+            TextButton(onClick = { if (query.isNotBlank()) onExpandSearch() else onExpandFilters() }) {
+                Text("调整", fontSize = 12.sp)
+            }
+            IconButton(onClick = onClearAll, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Default.Close, "清除全部条件", tint = OnSurface.copy(alpha = 0.55f),
+                    modifier = Modifier.size(18.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ThinProgress(label: String, progress: Int, total: Int) {
+    Surface(color = Surface) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)) {
+            Text(label, fontSize = 11.sp, color = OnSurface.copy(alpha = 0.7f))
+            Spacer(Modifier.height(4.dp))
+            LinearProgressIndicator(
+                progress = if (total > 0) progress.toFloat() / total else 0f,
+                modifier = Modifier.fillMaxWidth(), color = Primary, trackColor = ProgressTrack
+            )
+            Text("$progress / $total", fontSize = 10.sp, color = OnSurface.copy(alpha = 0.5f))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// 搜索面板
+// ---------------------------------------------------------------------
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun FilterSection(
+private fun SearchPanel(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    suggestions: List<String>,
+    ruleDescription: String?,
+    onClose: () -> Unit
+) {
+    PanelCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("搜索照片内容", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium,
+                modifier = Modifier.weight(1f))
+            IconButton(onClick = onClose, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Default.ExpandLess, "收起", modifier = Modifier.size(20.dp))
+            }
+        }
+        OutlinedTextField(
+            value = query,
+            onValueChange = onQueryChange,
+            placeholder = { Text("输入内容、时间或地点，如：2023年 北京 汽车", fontSize = 13.sp) },
+            leadingIcon = { Icon(Icons.Default.Search, null, modifier = Modifier.size(20.dp)) },
+            trailingIcon = {
+                if (query.isNotBlank()) IconButton(onClick = { onQueryChange("") }) {
+                    Icon(Icons.Default.Clear, "清空", modifier = Modifier.size(18.dp))
+                }
+            },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(10.dp)
+        )
+
+        // v3.7.0：明确、统一的时间写法提示
+        Text(
+            TimeQueryParser.TIME_QUERY_HINT,
+            fontSize = 11.sp,
+            color = Primary,
+            modifier = Modifier.padding(top = 8.dp, start = 2.dp)
+        )
+
+        if (ruleDescription != null && query.isNotBlank()) {
+            Text("匹配规则：$ruleDescription", fontSize = 11.sp, color = OnSurface.copy(alpha = 0.65f),
+                modifier = Modifier.padding(top = 6.dp, start = 2.dp))
+        }
+
+        Text("快捷搜索", fontSize = 11.sp, color = OnSurface.copy(alpha = 0.55f),
+            modifier = Modifier.padding(top = 10.dp, bottom = 4.dp))
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            items(suggestions) { s ->
+                SuggestionChip(
+                    onClick = { onQueryChange(s) },
+                    label = { Text(s, fontSize = 12.sp) },
+                    shape = CircleShape,
+                    colors = SuggestionChipDefaults.suggestionChipColors(
+                        containerColor = ChipBackground, labelColor = ChipText
+                    )
+                )
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// 时间 / 地点筛选面板
+// ---------------------------------------------------------------------
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun FilterPanel(
     timeRange: TimeRange?,
     locationQuery: LocationQuery?,
     availablePlaces: List<PlaceSuggestion>,
@@ -364,7 +478,8 @@ private fun FilterSection(
     onTimeRangeChange: (TimeRange?) -> Unit,
     onLocationQueryChange: (LocationQuery?) -> Unit,
     onSelectPlace: (PlaceSuggestion) -> Unit,
-    onClearFilters: () -> Unit
+    onClearFilters: () -> Unit,
+    onClose: () -> Unit
 ) {
     val now = remember { System.currentTimeMillis() }
     var customStart by remember { mutableStateOf("") }
@@ -372,222 +487,176 @@ private fun FilterSection(
     var customError by remember { mutableStateOf<String?>(null) }
     var locationText by remember { mutableStateOf(locationQuery?.raw ?: "") }
 
-    // 外部（清空按钮 / 空状态按钮）清除筛选时，同步清空本地输入
     LaunchedEffect(locationQuery?.raw) { locationText = locationQuery?.raw ?: "" }
     LaunchedEffect(filterSummary) {
         if (filterSummary == null) {
-            customStart = ""
-            customEnd = ""
-            customError = null
-            locationText = ""
+            customStart = ""; customEnd = ""; customError = null; locationText = ""
         }
     }
 
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 4.dp),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = Surface)
-    ) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.DateRange, null, tint = Primary, modifier = Modifier.size(20.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        "拍摄时间与地点",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
-                TextButton(onClick = {
-                    customStart = ""
-                    customEnd = ""
-                    customError = null
-                    locationText = ""
-                    onClearFilters()
-                }) { Text("重置", fontSize = 12.sp) }
-            }
-
-            if (filterSummary != null) {
-                Surface(shape = RoundedCornerShape(6.dp), color = Primary.copy(alpha = 0.10f)) {
-                    Text(
-                        "当前条件：$filterSummary",
-                        fontSize = 12.sp,
-                        color = Primary,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-            }
-
-            // ---------- 时间 ----------
-            Text("时间区间", style = MaterialTheme.typography.labelMedium, color = OnSurface.copy(alpha = 0.6f))
-            Spacer(modifier = Modifier.height(4.dp))
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                item {
-                    TimePresetChip("全部", timeRange == null) { onTimeRangeChange(null) }
-                }
-                item {
-                    TimePresetChip("今年", timeRange?.label == "今年") {
-                        onTimeRangeChange(TimeQueryParser.thisYear(now))
-                    }
-                }
-                item {
-                    TimePresetChip("去年", timeRange?.label == "去年") {
-                        onTimeRangeChange(TimeQueryParser.lastYear(now))
-                    }
-                }
-                item {
-                    TimePresetChip("最近3个月", timeRange?.label == "最近3个月") {
-                        onTimeRangeChange(TimeQueryParser.recentMonths(3, now))
-                    }
-                }
-                item {
-                    TimePresetChip("最近1年", timeRange?.label == "最近1年") {
-                        onTimeRangeChange(TimeQueryParser.recentMonths(12, now))
-                    }
-                }
-                item {
-                    TimePresetChip("最近30天", timeRange?.label == "最近30天") {
-                        onTimeRangeChange(TimeQueryParser.recentDays(30, now))
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(6.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = customStart,
-                    onValueChange = { customStart = it; customError = null },
-                    placeholder = { Text("2023-01-01", fontSize = 11.sp) },
-                    singleLine = true,
-                    textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
-                    modifier = Modifier.weight(1f)
-                )
-                Text(" ~ ", color = OnSurface.copy(alpha = 0.6f), fontSize = 12.sp)
-                OutlinedTextField(
-                    value = customEnd,
-                    onValueChange = { customEnd = it; customError = null },
-                    placeholder = { Text("2023-12-31", fontSize = 11.sp) },
-                    singleLine = true,
-                    textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
-                    modifier = Modifier.weight(1f)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Button(
-                    onClick = {
-                        val r = TimeQueryParser.fromDateStrings(customStart.trim(), customEnd.trim())
-                        if (r == null) customError = "请按 2023-01-01 格式填写起止日期"
-                        else { customError = null; onTimeRangeChange(r) }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Primary),
-                    shape = RoundedCornerShape(8.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
-                ) { Text("应用", fontSize = 12.sp) }
-            }
-            if (customError != null) {
-                Text(customError.orEmpty(), fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
-            } else if (timeRange != null) {
-                Text(
-                    "区间：${TimeQueryParser.format(timeRange)}",
-                    fontSize = 11.sp,
-                    color = Primary,
-                    modifier = Modifier.padding(top = 4.dp)
-                )
-            }
-
-            Divider(modifier = Modifier.padding(vertical = 10.dp))
-
-            // ---------- 地点 ----------
-            Text("拍摄地点（支持模糊）", style = MaterialTheme.typography.labelMedium, color = OnSurface.copy(alpha = 0.6f))
-            Spacer(modifier = Modifier.height(4.dp))
-            OutlinedTextField(
-                value = locationText,
-                onValueChange = { v ->
-                    locationText = v
-                    onLocationQueryChange(
-                        if (v.isBlank()) null else buildLocationQuery(v, availablePlaces)
-                    )
-                },
-                placeholder = { Text("输入或选择：北京 / 深圳 / 西湖…", fontSize = 12.sp) },
-                leadingIcon = { Icon(Icons.Default.Place, null, modifier = Modifier.size(18.dp)) },
-                trailingIcon = {
-                    if (locationText.isNotBlank()) {
-                        IconButton(onClick = { locationText = ""; onLocationQueryChange(null) }) {
-                            Icon(Icons.Default.Clear, null, modifier = Modifier.size(18.dp))
-                        }
-                    }
-                },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            if (availablePlaces.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    "已记录的地点（随上方时间区间联动）",
-                    fontSize = 11.sp,
-                    color = OnSurface.copy(alpha = 0.55f)
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(availablePlaces) { s ->
-                        SuggestionChip(
-                            onClick = { locationText = s.label; onSelectPlace(s) },
-                            label = { Text("${s.label} · ${s.count}", fontSize = 11.sp) },
-                            shape = CircleShape,
-                            colors = SuggestionChipDefaults.suggestionChipColors(
-                                containerColor = ChipBackground,
-                                labelColor = ChipText
-                            )
-                        )
-                    }
-                }
-            } else if (!isExtractingExif) {
-                Text(
-                    "还没有可用的地点信息。照片若不含 GPS，可在照片详情页手动标注地点。",
-                    fontSize = 11.sp,
-                    color = OnSurface.copy(alpha = 0.5f),
-                    modifier = Modifier.padding(top = 6.dp)
-                )
-            }
-
-            if (isExtractingExif) {
-                Spacer(modifier = Modifier.height(8.dp))
-                LinearProgressIndicator(
-                    progress = if (exifTotal > 0) exifProgress.toFloat() / exifTotal else 0f,
-                    modifier = Modifier.fillMaxWidth(),
-                    color = Primary,
-                    trackColor = ProgressTrack
-                )
-                Text(
-                    "正在读取照片的时间与地点 $exifProgress / $exifTotal",
-                    fontSize = 11.sp,
-                    color = OnSurface.copy(alpha = 0.6f),
-                    modifier = Modifier.padding(top = 4.dp)
-                )
-            }
-            if (timeRange != null && noTimeCount > 0) {
-                Text(
-                    "$noTimeCount 张照片缺少拍摄时间，未纳入时间筛选",
-                    fontSize = 11.sp,
-                    color = OnSurface.copy(alpha = 0.5f)
-                )
-            }
-            if (locationQuery != null && noLocationCount > 0) {
-                Text(
-                    "$noLocationCount 张照片没有地点信息，可在详情页手动标注",
-                    fontSize = 11.sp,
-                    color = OnSurface.copy(alpha = 0.5f)
-                )
+    PanelCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Tune, null, tint = Primary, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("筛选条件", style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+            TextButton(onClick = {
+                customStart = ""; customEnd = ""; customError = null; locationText = ""
+                onClearFilters()
+            }) { Text("重置", fontSize = 12.sp) }
+            IconButton(onClick = onClose, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Default.ExpandLess, "收起", modifier = Modifier.size(20.dp))
             }
         }
+
+        if (filterSummary != null) {
+            Surface(shape = RoundedCornerShape(6.dp), color = Primary.copy(alpha = 0.10f)) {
+                Text("当前：$filterSummary", fontSize = 11.sp, color = Primary,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+
+        // -------- 时间 --------
+        SectionTitle(Icons.Default.DateRange, "拍摄时间")
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            item { TimePresetChip("全部", timeRange == null) { onTimeRangeChange(null) } }
+            item { TimePresetChip("今年", timeRange?.label == "今年") { onTimeRangeChange(TimeQueryParser.thisYear(now)) } }
+            item { TimePresetChip("去年", timeRange?.label == "去年") { onTimeRangeChange(TimeQueryParser.lastYear(now)) } }
+            item { TimePresetChip("最近3个月", timeRange?.label == "最近3个月") { onTimeRangeChange(TimeQueryParser.recentMonths(3, now)) } }
+            item { TimePresetChip("最近1年", timeRange?.label == "最近1年") { onTimeRangeChange(TimeQueryParser.recentMonths(12, now)) } }
+            item { TimePresetChip("最近30天", timeRange?.label == "最近30天") { onTimeRangeChange(TimeQueryParser.recentDays(30, now)) } }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.Top) {
+            OutlinedTextField(
+                value = customStart,
+                onValueChange = { customStart = it; customError = null },
+                label = { Text("开始日期", fontSize = 11.sp) },
+                placeholder = { Text("2023-06-01", fontSize = 11.sp) },
+                singleLine = true,
+                textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(Modifier.width(6.dp))
+            OutlinedTextField(
+                value = customEnd,
+                onValueChange = { customEnd = it; customError = null },
+                label = { Text("结束日期", fontSize = 11.sp) },
+                placeholder = { Text("2023-12-31", fontSize = 11.sp) },
+                singleLine = true,
+                textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(Modifier.width(6.dp))
+            Button(
+                onClick = {
+                    val r = TimeQueryParser.fromDateStrings(customStart.trim(), customEnd.trim())
+                    if (r == null) customError = "日期格式不正确：${TimeQueryParser.DATE_FORMAT_HINT}"
+                    else { customError = null; onTimeRangeChange(r) }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                shape = RoundedCornerShape(8.dp),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 14.dp)
+            ) { Text("应用", fontSize = 12.sp) }
+        }
+        // v3.7.0：格式说明常驻，避免用户按错误格式填写
+        Text(TimeQueryParser.DATE_FORMAT_HINT, fontSize = 10.sp,
+            color = OnSurface.copy(alpha = 0.5f), modifier = Modifier.padding(top = 4.dp, start = 2.dp))
+        if (customError != null) {
+            Text(customError.orEmpty(), fontSize = 11.sp, color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 4.dp, start = 2.dp))
+        } else if (timeRange != null) {
+            Text("当前区间：${TimeQueryParser.displayLabel(timeRange)}", fontSize = 11.sp,
+                color = Primary, modifier = Modifier.padding(top = 4.dp, start = 2.dp))
+        }
+
+        Divider(modifier = Modifier.padding(vertical = 12.dp))
+
+        // -------- 地点 --------
+        SectionTitle(Icons.Default.Place, "拍摄地点（支持模糊）")
+        OutlinedTextField(
+            value = locationText,
+            onValueChange = { v ->
+                locationText = v
+                onLocationQueryChange(if (v.isBlank()) null else buildLocationQuery(v, availablePlaces))
+            },
+            placeholder = { Text("输入或选择：北京 / 深圳 / 西湖…", fontSize = 12.sp) },
+            leadingIcon = { Icon(Icons.Default.Place, null, modifier = Modifier.size(18.dp)) },
+            trailingIcon = {
+                if (locationText.isNotBlank()) IconButton(onClick = {
+                    locationText = ""; onLocationQueryChange(null)
+                }) { Icon(Icons.Default.Clear, null, modifier = Modifier.size(18.dp)) }
+            },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(10.dp)
+        )
+
+        if (availablePlaces.isNotEmpty()) {
+            Spacer(Modifier.height(6.dp))
+            Text("已记录的地点（随时间区间联动）", fontSize = 10.sp,
+                color = OnSurface.copy(alpha = 0.55f))
+            Spacer(Modifier.height(4.dp))
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                items(availablePlaces) { s ->
+                    SuggestionChip(
+                        onClick = { locationText = s.label; onSelectPlace(s) },
+                        label = { Text("${s.label} · ${s.count}", fontSize = 11.sp) },
+                        shape = CircleShape,
+                        colors = SuggestionChipDefaults.suggestionChipColors(
+                            containerColor = ChipBackground, labelColor = ChipText
+                        )
+                    )
+                }
+            }
+        } else if (!isExtractingExif) {
+            Text("还没有可用的地点信息。照片若不含 GPS，可在照片详情页手动标注地点。",
+                fontSize = 10.sp, color = OnSurface.copy(alpha = 0.5f),
+                modifier = Modifier.padding(top = 6.dp))
+        }
+
+        if (isExtractingExif) {
+            Spacer(Modifier.height(8.dp))
+            LinearProgressIndicator(
+                progress = if (exifTotal > 0) exifProgress.toFloat() / exifTotal else 0f,
+                modifier = Modifier.fillMaxWidth(), color = Primary, trackColor = ProgressTrack
+            )
+            Text("正在读取照片的时间与地点 $exifProgress / $exifTotal", fontSize = 10.sp,
+                color = OnSurface.copy(alpha = 0.6f), modifier = Modifier.padding(top = 4.dp))
+        }
+        if (timeRange != null && noTimeCount > 0) {
+            Text("$noTimeCount 张照片缺少拍摄时间，未纳入时间筛选", fontSize = 10.sp,
+                color = OnSurface.copy(alpha = 0.5f))
+        }
+        if (locationQuery != null && noLocationCount > 0) {
+            Text("$noLocationCount 张照片没有地点信息，可在详情页手动标注", fontSize = 10.sp,
+                color = OnSurface.copy(alpha = 0.5f))
+        }
+        Text("提示：时间、地点与搜索词按「同时满足」联动", fontSize = 10.sp,
+            color = OnSurface.copy(alpha = 0.45f), modifier = Modifier.padding(top = 6.dp))
+    }
+}
+
+@Composable
+private fun PanelCard(content: @Composable ColumnScope.() -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 5.dp),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = Surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp), content = content)
+    }
+}
+
+@Composable
+private fun SectionTitle(icon: androidx.compose.ui.graphics.vector.ImageVector, text: String) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 6.dp)) {
+        Icon(icon, null, tint = Primary, modifier = Modifier.size(16.dp))
+        Spacer(Modifier.width(6.dp))
+        Text(text, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = OnSurface)
     }
 }
 
@@ -596,7 +665,7 @@ private fun FilterSection(
 private fun TimePresetChip(label: String, selected: Boolean, onClick: () -> Unit) {
     SuggestionChip(
         onClick = onClick,
-        label = { Text(label, fontSize = 12.sp) },
+        label = { Text(label, fontSize = 11.sp) },
         shape = CircleShape,
         colors = SuggestionChipDefaults.suggestionChipColors(
             containerColor = if (selected) Primary.copy(alpha = 0.18f) else ChipBackground,
@@ -605,7 +674,6 @@ private fun TimePresetChip(label: String, selected: Boolean, onClick: () -> Unit
     )
 }
 
-/** 把用户输入构造成地点查询：内置城市带中心点启用半径匹配，其余走文本模糊。 */
 private fun buildLocationQuery(text: String, places: List<PlaceSuggestion>): LocationQuery {
     val t = text.trim()
     val place = PlaceCatalog.findByQuery(t)
@@ -615,231 +683,122 @@ private fun buildLocationQuery(text: String, places: List<PlaceSuggestion>): Loc
         val sn = PlaceCatalog.normalize(s.label)
         sn.length >= 2 && n.length >= 2 && (sn.contains(n) || n.contains(sn))
     }
-    return LocationQuery(
-        raw = t,
-        normalized = n,
-        centerLat = known?.lat,
-        centerLon = known?.lon,
-        radiusKm = 60.0
-    )
+    return LocationQuery(raw = t, normalized = n,
+        centerLat = known?.lat, centerLon = known?.lon, radiusKm = 60.0)
 }
 
-@Composable
-private fun SearchSection(
-    query: String,
-    onQueryChange: (String) -> Unit,
-    suggestions: List<String>,
-    ruleDescription: String?
-) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(12.dp),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = Surface)
-    ) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            OutlinedTextField(
-                value = query,
-                onValueChange = onQueryChange,
-                placeholder = { Text("搜索：有车、光膀子、泰山…") },
-                leadingIcon = { Icon(Icons.Default.Search, null) },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(8.dp)
-            )
-
-            if (ruleDescription != null && query.isNotBlank()) {
-                Text(
-                    text = "匹配规则: $ruleDescription",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Primary,
-                    modifier = Modifier.padding(top = 4.dp, start = 4.dp)
-                )
-            }
-
-            if (query.isBlank()) {
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "快捷搜索:",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = OnSurface.copy(alpha = 0.6f)
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                LazyRow(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    items(suggestions) { suggestion ->
-                        SuggestionChip(
-                            onClick = { onQueryChange(suggestion) },
-                            label = { Text(text = suggestion, fontSize = 13.sp) },
-                            shape = CircleShape,
-                            colors = SuggestionChipDefaults.suggestionChipColors(
-                                containerColor = ChipBackground,
-                                labelColor = ChipText
-                            )
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
+// ---------------------------------------------------------------------
+// 分析状态细条
+// ---------------------------------------------------------------------
 
 @Composable
-private fun AnalysisSection(
+private fun AnalysisStatusBar(
     isAnalyzing: Boolean,
     hasAnalyzed: Boolean,
     progress: Int,
     total: Int,
     photoCount: Int,
-    onStartAnalysis: () -> Unit,
-    onResumeAnalysis: () -> Unit,
-    onRestartAnalysis: () -> Unit,
     canResume: Boolean,
     savedProgress: Int,
-    savedTotal: Int
+    savedTotal: Int,
+    isExtractingExif: Boolean,
+    exifProgress: Int,
+    exifTotal: Int,
+    onStartAnalysis: () -> Unit,
+    onResumeAnalysis: () -> Unit,
+    onRestartAnalysis: () -> Unit
 ) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 4.dp),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = Surface)
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            when {
-                isAnalyzing -> {
-                    Text("正在分析照片…", style = MaterialTheme.typography.bodyLarge)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    LinearProgressIndicator(
-                        progress = if (total > 0) progress.toFloat() / total else 0f,
-                        modifier = Modifier.fillMaxWidth(),
-                        color = Primary,
-                        trackColor = ProgressTrack,
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        "已分析 $progress / $total",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = OnSurface.copy(alpha = 0.6f)
-                    )
-                }
-                canResume -> {
-                    Text(
-                        "上次分析中断，已保存进度",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = OnSurface.copy(alpha = 0.7f)
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        "已完成 $savedProgress / $savedTotal",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Primary
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            onClick = onRestartAnalysis,
-                            shape = RoundedCornerShape(8.dp)
-                        ) {
-                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("重新分析")
-                        }
-                        Button(
-                            onClick = onResumeAnalysis,
-                            colors = ButtonDefaults.buttonColors(containerColor = Primary),
-                            shape = RoundedCornerShape(8.dp)
-                        ) {
-                            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("继续分析")
-                        }
-                    }
-                }
-                !hasAnalyzed && photoCount > 0 -> {
-                    Text(
-                        "首次使用需要分析照片内容",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = OnSurface.copy(alpha = 0.7f)
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Button(
-                        onClick = onStartAnalysis,
-                        colors = ButtonDefaults.buttonColors(containerColor = Primary),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Icon(Icons.Default.PhotoLibrary, null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("开始智能分析")
-                    }
-                }
-                hasAnalyzed -> {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center
-                        ) {
-                            Icon(Icons.Default.CheckCircle, null, tint = Secondary, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                "分析完成，可以搜索照片内容",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = Secondary
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                        TextButton(onClick = onRestartAnalysis) {
-                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("重新分析全部（更换模型 / Key 后使用）", fontSize = 12.sp)
-                        }
-                    }
-                }
+    when {
+        isAnalyzing -> ThinProgress("正在分析照片内容…", progress, total)
+        canResume -> Surface(color = Surface) {
+            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Text("上次分析中断（$savedProgress / $savedTotal）", fontSize = 11.sp,
+                    color = OnSurface.copy(alpha = 0.7f), modifier = Modifier.weight(1f))
+                TextButton(onClick = onRestartAnalysis) { Text("重来", fontSize = 11.sp) }
+                Button(onClick = onResumeAnalysis,
+                    colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                ) { Text("继续", fontSize = 11.sp) }
             }
         }
+        !hasAnalyzed && photoCount > 0 -> Surface(color = Surface) {
+            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Text("尚未分析照片内容，无法按内容搜索", fontSize = 11.sp,
+                    color = OnSurface.copy(alpha = 0.7f), modifier = Modifier.weight(1f))
+                Button(onClick = onStartAnalysis,
+                    colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                ) { Text("开始分析", fontSize = 11.sp) }
+            }
+        }
+        isExtractingExif -> Surface(color = Surface) {
+            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Text("正在读取照片信息 $exifProgress / $exifTotal", fontSize = 10.sp,
+                    color = OnSurface.copy(alpha = 0.55f))
+            }
+        }
+        // 分析完成：不占任何空间，把屏幕留给照片
+        else -> Unit
     }
 }
 
+// ---------------------------------------------------------------------
+// 照片集合：网格 / 列表
+// ---------------------------------------------------------------------
+
 @Composable
-private fun EmptyState(
-    message: String,
-    actionLabel: String? = null,
-    onAction: (() -> Unit)? = null
+private fun PhotoCollection(
+    photos: List<PhotoItem>,
+    listMode: Boolean,
+    exifMap: Map<Long, PhotoExif>,
+    selectionMode: Boolean,
+    selectedIds: Set<Long>,
+    onPhotoClick: (PhotoItem) -> Unit,
+    onPhotoLongClick: (PhotoItem) -> Unit,
+    onPhotoSelect: (Long) -> Unit
 ) {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Icon(
-                Icons.Default.Search,
-                null,
-                modifier = Modifier.size(64.dp),
-                tint = OnSurface.copy(alpha = 0.3f)
-            )
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(
-                message,
-                style = MaterialTheme.typography.bodyLarge,
-                color = OnSurface.copy(alpha = 0.5f),
-                modifier = Modifier.padding(horizontal = 32.dp)
-            )
-            if (actionLabel != null && onAction != null) {
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(
-                    onClick = { onAction?.invoke() },
-                    colors = ButtonDefaults.buttonColors(containerColor = Primary),
-                    shape = RoundedCornerShape(8.dp)
-                ) {
-                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(actionLabel.orEmpty())
-                }
+    if (listMode) {
+        LazyColumn(
+            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            items(photos, key = { it.id }) { photo ->
+                PhotoListItem(
+                    photo = photo,
+                    exif = exifMap[photo.id],
+                    selectionMode = selectionMode,
+                    isSelected = selectedIds.contains(photo.id),
+                    onClick = {
+                        if (selectionMode) onPhotoSelect(photo.id) else onPhotoClick(photo)
+                    },
+                    onLongClick = { onPhotoLongClick(photo) }
+                )
+            }
+        }
+    } else {
+        LazyVerticalGrid(
+            columns = GridCells.Adaptive(110.dp),
+            contentPadding = PaddingValues(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            gridItems(photos, key = { it.id }) { photo ->
+                PhotoThumbnail(
+                    photo = photo,
+                    selectionMode = selectionMode,
+                    isSelected = selectedIds.contains(photo.id),
+                    onClick = {
+                        if (selectionMode) onPhotoSelect(photo.id) else onPhotoClick(photo)
+                    },
+                    onLongClick = { onPhotoLongClick(photo) }
+                )
             }
         }
     }
@@ -847,36 +806,94 @@ private fun EmptyState(
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun PhotoGrid(
-    photos: List<PhotoItem>,
+private fun PhotoListItem(
+    photo: PhotoItem,
+    exif: PhotoExif?,
     selectionMode: Boolean,
-    selectedIds: Set<Long>,
-    onPhotoClick: (PhotoItem) -> Unit,
-    onPhotoLongClick: (PhotoItem) -> Unit,
-    onPhotoSelect: (Long) -> Unit
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
 ) {
-    LazyVerticalGrid(
-        columns = GridCells.Adaptive(110.dp),
-        contentPadding = PaddingValues(8.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-        modifier = Modifier.fillMaxSize()
+    val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
+    val fallbackTime = if (photo.dateTaken > 0L && photo.dateTaken < 100_000_000_000L)
+        photo.dateTaken * 1000L else photo.dateTaken
+    val timeText = when {
+        exif != null && exif.hasTime -> exif.dateTimeLabel()
+        fallbackTime > 0L -> dateFormat.format(Date(fallbackTime))
+        else -> "拍摄时间未知"
+    }
+    val placeText = exif?.placeLabel()?.takeIf { it.isNotBlank() } ?: "地点未知"
+    val infoLine = buildList {
+        exif?.formatLabel()?.takeIf { it.isNotBlank() }?.let { add(it) }
+        exif?.dimensionLabel()?.takeIf { it.isNotBlank() }?.let { add(it) }
+        exif?.fileSizeLabel()?.takeIf { it.isNotBlank() }?.let { add(it) }
+        exif?.cameraLabel()?.takeIf { it.isNotBlank() }?.let { add(it) }
+    }.joinToString(" · ").ifBlank { "格式信息未知" }
+
+    val cnTags = photo.metadata?.chineseDisplayTags(4).orEmpty().ifEmpty {
+        exif?.displayTags()?.take(4).orEmpty()
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth().combinedClickable(onClick = onClick, onLongClick = onLongClick),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = if (isSelected) 3.dp else 1.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected) Primary.copy(alpha = 0.10f) else Surface
+        )
     ) {
-        gridItems(photos, key = { it.id }) { photo ->
-            PhotoThumbnail(
-                photo = photo,
-                selectionMode = selectionMode,
-                isSelected = selectedIds.contains(photo.id),
-                onClick = {
-                    if (selectionMode) {
-                        onPhotoSelect(photo.id)
-                    } else {
-                        onPhotoClick(photo)
+        Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.Top) {
+            Box {
+                AsyncImage(
+                    model = photo.uri,
+                    contentDescription = photo.displayName,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.size(88.dp).clip(RoundedCornerShape(8.dp))
+                )
+                if (selectionMode) {
+                    Box(
+                        modifier = Modifier.align(Alignment.TopStart).padding(4.dp).size(20.dp)
+                            .clip(CircleShape)
+                            .background(if (isSelected) Primary else Color.White.copy(alpha = 0.85f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (isSelected) Icon(Icons.Default.Check, null, tint = Color.White,
+                            modifier = Modifier.size(14.dp))
                     }
-                },
-                onLongClick = { onPhotoLongClick(photo) }
-            )
+                }
+            }
+
+            Spacer(Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(photo.displayName, fontSize = 13.sp, fontWeight = FontWeight.Medium,
+                    color = OnSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Spacer(Modifier.height(4.dp))
+                InfoLine(Icons.Default.DateRange, timeText)
+                InfoLine(Icons.Default.Place, placeText)
+                InfoLine(Icons.Default.PhotoLibrary, infoLine)
+                if (cnTags.isNotEmpty()) {
+                    Spacer(Modifier.height(6.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        items(cnTags) { tag ->
+                            Surface(shape = RoundedCornerShape(10.dp), color = ChipBackground) {
+                                Text(tag, fontSize = 10.sp, color = ChipText,
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp))
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+}
+
+@Composable
+private fun InfoLine(icon: androidx.compose.ui.graphics.vector.ImageVector, text: String) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 1.dp)) {
+        Icon(icon, null, tint = OnSurface.copy(alpha = 0.45f), modifier = Modifier.size(13.dp))
+        Spacer(Modifier.width(5.dp))
+        Text(text, fontSize = 11.sp, color = OnSurface.copy(alpha = 0.75f),
+            maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
 
@@ -890,16 +907,9 @@ private fun PhotoThumbnail(
     onLongClick: () -> Unit
 ) {
     Card(
-        modifier = Modifier
-            .aspectRatio(1f)
-            .combinedClickable(
-                onClick = onClick,
-                onLongClick = onLongClick
-            ),
+        modifier = Modifier.aspectRatio(1f).combinedClickable(onClick = onClick, onLongClick = onLongClick),
         shape = RoundedCornerShape(8.dp),
-        elevation = CardDefaults.cardElevation(
-            defaultElevation = if (isSelected) 4.dp else 1.dp
-        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = if (isSelected) 4.dp else 1.dp),
         colors = CardDefaults.cardColors(
             containerColor = if (isSelected) Primary.copy(alpha = 0.15f) else Color.White
         )
@@ -911,39 +921,45 @@ private fun PhotoThumbnail(
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
             )
-
-            // Selection checkbox overlay
             if (selectionMode) {
                 Box(
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(4.dp)
-                        .size(24.dp)
+                    modifier = Modifier.align(Alignment.TopStart).padding(4.dp).size(24.dp)
                         .clip(CircleShape)
-                        .background(
-                            if (isSelected) Primary else Color.White.copy(alpha = 0.8f)
-                        ),
+                        .background(if (isSelected) Primary else Color.White.copy(alpha = 0.8f)),
                     contentAlignment = Alignment.Center
                 ) {
-                    if (isSelected) {
-                        Icon(
-                            Icons.Default.Check,
-                            null,
-                            tint = Color.White,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
+                    if (isSelected) Icon(Icons.Default.Check, null, tint = Color.White,
+                        modifier = Modifier.size(16.dp))
                 }
-            } else if (photo.isAnalyzed && photo.labels.isNotEmpty()) {
-                // Analysis indicator (only in normal mode)
+            } else if (photo.isAnalyzed) {
                 Box(
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(4.dp)
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(Secondary)
+                    modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).size(8.dp)
+                        .clip(CircleShape).background(Secondary)
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun EmptyState(message: String, actionLabel: String? = null, onAction: (() -> Unit)? = null) {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(Icons.Default.Search, null, modifier = Modifier.size(56.dp),
+                tint = OnSurface.copy(alpha = 0.25f))
+            Spacer(Modifier.height(14.dp))
+            Text(message, style = MaterialTheme.typography.bodyMedium,
+                color = OnSurface.copy(alpha = 0.5f),
+                modifier = Modifier.padding(horizontal = 32.dp))
+            if (actionLabel != null && onAction != null) {
+                Spacer(Modifier.height(14.dp))
+                Button(onClick = { onAction?.invoke() },
+                    colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                    shape = RoundedCornerShape(8.dp)) {
+                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(actionLabel)
+                }
             }
         }
     }

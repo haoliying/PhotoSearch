@@ -8,6 +8,7 @@ import android.media.ExifInterface
 import android.net.Uri
 import android.util.Base64
 import com.example.photosearch.data.AppConfig
+import com.example.photosearch.data.LabelTranslator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -222,9 +223,12 @@ class VisionLanguageAnalyzer(private val context: Context) {
                     when (val v = obj.opt(key)) {
                         is JSONArray -> for (i in 0 until v.length()) {
                             val s = v.optString(i, "").trim()
-                            if (s.isNotBlank()) kws += s
+                            // v3.7.0：模型偶尔夹带英文关键词，统一转成中文标签
+                            if (s.isNotBlank()) LabelTranslator.toChinese(s)?.let { kws += it }
                         }
-                        is String -> if (v.isNotBlank()) kws += v.trim()
+                        is String -> if (v.isNotBlank()) {
+                            LabelTranslator.toChinese(v.trim())?.let { kws += it }
+                        }
                     }
                 }
                 if (desc.isNotBlank() || kws.isNotEmpty()) {
@@ -268,7 +272,8 @@ class VisionLanguageAnalyzer(private val context: Context) {
             keywords = extractKeywordsFromDescription(description)
         }
 
-        return VlmResult(description, keywords, true)
+        // v3.7.0：无论走哪条解析路径，输出给界面的关键词一律中文
+        return VlmResult(description, LabelTranslator.toChineseLabels(keywords), true)
     }
 
     private fun extractKeywordsFromDescription(desc: String): List<String> {
@@ -386,6 +391,7 @@ class VisionLanguageAnalyzer(private val context: Context) {
 {"description":"用中文一到两句话客观描述画面主体、场景、人物动作、衣着与显著物体","objects":["画面中确实存在的具体物体名称，用中文常用名词，例如 轿车、咖啡杯、笔记本电脑、雨伞、气球、篮球、书本、猫"],"scene":"场景类型，例如 室内、户外、海滩、山景、城市街道、餐厅、夜景","attributes":["显著属性，例如 夜晚、下雪、多人合影、光着上身、微笑"],"keywords":["8 到 20 个可用于检索的中文关键词，必须来自上面各项，尽量覆盖所有可搜索内容"]}
 
 规则：
+- **所有字段（description / objects / scene / attributes / keywords）一律使用简体中文**，不要输出英文单词、拼音或中英混排；仅品牌、型号等专有名词允许保留英文原文。
 - 只写画面里真实存在的东西。看到山不要写「泰山」，除非画面里有可辨认的文字标识；不要猜品牌、地名、人名。
 - 物体名必须用具体名词，不要用「物体」「东西」「物品」「景观」这类泛称，否则用户搜不到。
 - 若画面中有人光着上身 / 没穿上衣，必须在 attributes 和 keywords 里写「光膀子」。

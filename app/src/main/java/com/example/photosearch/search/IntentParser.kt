@@ -119,7 +119,7 @@ object IntentParser {
         val (time, afterTime) = TimeQueryParser.parse(query.trim())
         val (loc, afterLoc) = LocationMatcher.extract(afterTime)
         val pieces = mutableListOf<String>()
-        if (time != null) pieces += "时间 ${time.label.ifBlank { TimeQueryParser.format(time) }}"
+        if (time != null) pieces += "时间 ${TimeQueryParser.displayLabel(time)}"
         if (loc != null) pieces += "地点 ${loc.raw}"
 
         val positive = extractNegations(LocationMatcher.cleanup(afterLoc)).first
@@ -140,6 +140,8 @@ object IntentParser {
         "有车", "人物", "光膀子", "泰山", "海滩", "宠物", "美食", "建筑",
         "自行车", "咖啡", "笔记本电脑", "书", "夜景", "运动", "花卉",
         "自拍", "合影", "日落", "雪景", "婚礼", "宝宝", "室内", "气球",
-        "2023年", "去年", "最近三个月", "北京", "上海", "2023年在北京拍的汽车"
+        "2023年", "去年", "最近三个月", "北京", "上海", "2023年在北京拍的汽车",
+        // v3.7.0：补齐时间写法的规范示例，与筛选面板提示保持一致
+        "2023-06-01 到 2023-12-31", "2023年6月", "去年夏天", "国庆", "竖幅", "广角", "JPEG"
     )
 }

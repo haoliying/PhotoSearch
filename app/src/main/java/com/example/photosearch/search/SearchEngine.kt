@@ -137,7 +137,7 @@ object SearchEngine {
 
     private fun filterLabels(intent: SearchIntent): List<String> {
         val out = mutableListOf<String>()
-        intent.timeRange?.let { out += "时间:${it.label.ifBlank { TimeQueryParser.format(it) }}" }
+        intent.timeRange?.let { out += "时间:${TimeQueryParser.displayLabel(it)}" }
         intent.locationQuery?.let { out += "地点:${it.raw}" }
         return out
     }

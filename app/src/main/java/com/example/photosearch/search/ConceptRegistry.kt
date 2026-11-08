@@ -395,6 +395,8 @@ object ConceptRegistry {
                 val mm = String.format(java.util.Locale.US, "%02d", mo)
                 listOf("$y", "${y}年", "${y}年${mo}月", "$y-$mm").forEach { add(it, 0.70f) }
             }
+            // v3.7.0：相机 / 镜头 / 曝光 / 画幅 / 格式 / 季节 / 时段等中文标签
+            exif.searchableExifTags().forEach { add(it, 0.75f) }
         }
         return SearchIndex(entries)
     }

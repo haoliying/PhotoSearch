@@ -24,6 +24,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.example.photosearch.data.LabelTranslator
 import com.example.photosearch.data.PhotoExif
 import com.example.photosearch.data.PhotoItem
 import com.example.photosearch.data.PhotoMetadata
@@ -47,7 +48,12 @@ fun PhotoDetailScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("照片详情", color = Color.White) },
+                title = {
+                    Column {
+                        Text("照片详情", color = Color.White, style = MaterialTheme.typography.titleMedium)
+                        Text("右滑可返回上一级", color = Color.White.copy(alpha = 0.7f), fontSize = 10.sp)
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.Default.ArrowBack, "返回", tint = Color.White)
@@ -144,6 +150,43 @@ fun PhotoDetailScreen(
                             "manual" -> "手动标注"
                             else -> "未记录"
                         })
+
+                        // v3.7.0：EXIF 还能提取的相机 / 镜头 / 曝光 / 格式等信息
+                        val paramRows = exif.exifInfoRows()
+                        if (paramRows.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                "拍摄参数与文件信息",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Primary
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            paramRows.forEach { (k, v) ->
+                                InfoRow(k, v)
+                                Spacer(modifier = Modifier.height(6.dp))
+                            }
+                        }
+
+                        val exifTags = exif.displayTags()
+                        if (exifTags.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text("可检索标签", style = MaterialTheme.typography.labelMedium,
+                                color = OnSurface.copy(alpha = 0.6f))
+                            Spacer(modifier = Modifier.height(6.dp))
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                exifTags.forEach { tag ->
+                                    Surface(shape = RoundedCornerShape(12.dp),
+                                        color = Primary.copy(alpha = 0.10f)) {
+                                        Text(tag, fontSize = 11.sp, color = Primary,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
+                                    }
+                                }
+                            }
+                        }
                         Spacer(modifier = Modifier.height(8.dp))
 
                         Row(
@@ -229,7 +272,7 @@ fun PhotoDetailScreen(
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     verticalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    metadata.vlmKeywords.forEach { kw ->
+                                    LabelTranslator.toChineseLabels(metadata.vlmKeywords).forEach { kw ->
                                         Surface(
                                             shape = RoundedCornerShape(12.dp),
                                             color = Primary.copy(alpha = 0.1f)
@@ -273,9 +316,14 @@ fun PhotoDetailScreen(
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                metadata.detectedObjects.forEach { obj ->
-                                    LabelChip(obj.label, obj.confidence)
-                                }
+                                metadata.detectedObjects.sortedByDescending { it.confidence }
+                                    .mapNotNull { obj ->
+                                        LabelTranslator.toChinese(obj.label)?.let { it to obj.confidence }
+                                    }
+                                    .distinctBy { it.first }
+                                    .forEach { (text, confidence) ->
+                                        LabelChip(text, confidence)
+                                    }
                             }
                             Spacer(modifier = Modifier.height(8.dp))
                         }
@@ -308,9 +356,14 @@ fun PhotoDetailScreen(
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                metadata.labels.sortedByDescending { it.confidence }.forEach { label ->
-                                    LabelChip(label.text, label.confidence)
-                                }
+                                metadata.labels.sortedByDescending { it.confidence }
+                                    .mapNotNull { label ->
+                                        LabelTranslator.toChinese(label.text)?.let { it to label.confidence }
+                                    }
+                                    .distinctBy { it.first }
+                                    .forEach { (text, confidence) ->
+                                        LabelChip(text, confidence)
+                                    }
                             }
                         }
 

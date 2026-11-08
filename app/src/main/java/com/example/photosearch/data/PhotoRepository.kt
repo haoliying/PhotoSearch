@@ -15,6 +15,11 @@ class PhotoRepository(private val context: Context) {
         // 避免不同 compileSdk 下的可用性差异；列名本身是稳定的 MediaStore 契约。
         private const val COL_LATITUDE = "latitude"
         private const val COL_LONGITUDE = "longitude"
+        // 用字符串列名读取，避免不同 compileSdk 下常量可用性差异
+        private const val COL_WIDTH = "width"
+        private const val COL_HEIGHT = "height"
+        private const val COL_SIZE = "_size"
+        private const val COL_MIME = "mime_type"
     }
 
     suspend fun loadAllPhotos(): List<PhotoItem> = withContext(Dispatchers.IO) {
@@ -26,7 +31,7 @@ class PhotoRepository(private val context: Context) {
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         }
 
-        val projection = arrayOf(
+        val baseProjection = arrayOf(
             MediaStore.Images.Media._ID,
             MediaStore.Images.Media.DISPLAY_NAME,
             MediaStore.Images.Media.DATE_TAKEN,
@@ -35,6 +40,12 @@ class PhotoRepository(private val context: Context) {
             COL_LATITUDE,
             COL_LONGITUDE
         )
+        // WIDTH / HEIGHT / _size / mime_type 在 API 29 之前不一定存在，
+        // 旧系统上不投影这些列，避免 SQLite 报「no such column」；
+        // 此时宽高由 ExifReader 从 EXIF 的 ImageWidth / ImageLength 兜底读取。
+        val projection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            baseProjection + arrayOf(COL_WIDTH, COL_HEIGHT, COL_SIZE, COL_MIME)
+        } else baseProjection
 
         val sortOrder = "${MediaStore.Images.Media.DATE_TAKEN} DESC"
 
@@ -52,6 +63,10 @@ class PhotoRepository(private val context: Context) {
             val modifiedColumn = cursor.getColumnIndex(MediaStore.Images.Media.DATE_MODIFIED)
             val latColumn = cursor.getColumnIndex(COL_LATITUDE)
             val lonColumn = cursor.getColumnIndex(COL_LONGITUDE)
+            val widthColumn = cursor.getColumnIndex(COL_WIDTH)
+            val heightColumn = cursor.getColumnIndex(COL_HEIGHT)
+            val sizeColumn = cursor.getColumnIndex(COL_SIZE)
+            val mimeColumn = cursor.getColumnIndex(COL_MIME)
 
             while (cursor.moveToNext()) {
                 if (idColumn < 0) break
@@ -83,7 +98,11 @@ class PhotoRepository(private val context: Context) {
                         dateTaken = date,
                         displayName = name,
                         latitude = lat,
-                        longitude = lon
+                        longitude = lon,
+                        width = if (widthColumn >= 0) cursor.getInt(widthColumn) else 0,
+                        height = if (heightColumn >= 0) cursor.getInt(heightColumn) else 0,
+                        sizeBytes = if (sizeColumn >= 0) cursor.getLong(sizeColumn) else 0L,
+                        mimeType = if (mimeColumn >= 0) cursor.getString(mimeColumn).orEmpty() else ""
                     )
                 )
             }
