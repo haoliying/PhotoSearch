@@ -43,22 +43,47 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      # 首次运行（Gradle 缓存未命中时）需要下载 gradle-8.2-bin.zip（约 100MB），
-      # services.gradle.org 偶发慢/中断；先单独预热并重试，避免整次构建直接失败。
-      - name: Warm up Gradle wrapper (with retry)
+      # services.gradle.org / downloads.gradle.org 都会重定向到 GitHub Releases，
+      # 该下载源偶发 504/超时且 Gradle 缓存未命中时构建必然失败。
+      # 这里从多个镜像预下载并解压发行版，直接用解压后的 gradle 二进制构建，
+      # 完全绕开 wrapper 下载；仓库中的官方 distributionUrl 保持不变，
+      # 用户本地开发不受影响。
+      - name: Prepare Gradle distribution (mirror fallback)
         run: |
-          for i in 1 2 3; do
-            ./gradlew --version && exit 0
-            echo "gradle wrapper attempt $i failed, retrying in 5s..."
-            sleep 5
+          set -e
+          ZIP="$RUNNER_TEMP/gradle-8.2-bin.zip"
+          DIST="$RUNNER_TEMP/gradle-dist"
+          OK=0
+          for M in \
+            "https://mirrors.cloud.tencent.com/gradle/gradle-8.2-bin.zip" \
+            "https://repo.huaweicloud.com/gradle/gradle-8.2-bin.zip" \
+            "https://mirrors.aliyun.com/macports/distfiles/gradle/gradle-8.2-bin.zip" \
+            "https://services.gradle.org/distributions/gradle-8.2-bin.zip"; do
+            echo "trying $M"
+            rm -f "$ZIP"
+            if curl -fL --retry 2 --connect-timeout 20 --max-time 300 -o "$ZIP" "$M" \
+               && [ -s "$ZIP" ] \
+               && unzip -t "$ZIP" > /dev/null 2>&1 \
+               && unzip -l "$ZIP" | grep -q "gradle-8.2/bin/gradle"; then
+              echo "Gradle distribution OK: $M"
+              OK=1
+              break
+            fi
           done
-          echo "gradle wrapper warm-up failed after 3 attempts"
-          exit 1
+          test "$OK" = "1" || { echo "all Gradle distribution mirrors failed"; exit 1; }
+          ls -lh "$ZIP"
+          rm -rf "$DIST"
+          mkdir -p "$DIST"
+          unzip -q "$ZIP" -d "$DIST"
+          GRADLE_BIN="$DIST/gradle-8.2/bin/gradle"
+          chmod +x "$GRADLE_BIN"
+          echo "GRADLE_BIN=$GRADLE_BIN" >> "$GITHUB_ENV"
+          "$GRADLE_BIN" --version
 
       - name: Build unsigned release APK
         run: |
           [ -f app/proguard-rules.pro ] || touch app/proguard-rules.pro
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          "$GRADLE_BIN" assembleRelease --no-daemon --stacktrace
 
       - name: Decode release keystore
         env:
