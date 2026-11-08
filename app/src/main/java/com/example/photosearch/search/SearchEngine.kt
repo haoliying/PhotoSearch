@@ -2,24 +2,40 @@ package com.example.photosearch.search
 
 import com.example.photosearch.data.PhotoItem
 import com.example.photosearch.data.PhotoMetadata
-import com.example.photosearch.data.toSearchableTags
 
 /**
- * Semantic search engine that matches photos against parsed search intents.
+ * 检索引擎（替换版）。
+ * 替换路径：app/src/main/java/com/example/photosearch/search/SearchEngine.kt
  *
- * Priority order for matching:
- * 1. VLM description text (most accurate - rich Chinese natural language)
- * 2. VLM keywords (structured keywords from VLM)
- * 3. Searchable tags (derived from ML Kit labels + scene type)
- * 4. ML Kit labels (raw English labels)
+ * 相对原版的修复：
+ * 1. 彻底删除 fuzzyMatch / matchAgainstText / 2 字子串 / 双向 contains。
+ *    原版 fuzzyMatch 把 2 字符子串匹配用在英文上：'car' 的 'ca' 命中
+ *    'landscape'、'vehicle' 的 'cl' 命中 'cloud'，导致搜「汽车」返回整个相册。
+ * 2. 匹配单位由「自由文本」改为「规范概念 + 证据强度」。
+ * 3. negation 不再用 (1 - score) 加分；命中排除项直接否决。
+ * 4. RANK 阈值从 0.05 提到 0.45，并要求每个正向条件都拿到最低分。
+ * 5. 不采信 toSearchableTags() 里的启发式推断标签
+ *    （原版会把「海滩 + 人物」直接推断成「光膀子」）。
  */
 object SearchEngine {
+
+    private const val MIN_EVIDENCE = 0.5f     // 概念证据强度下限
+    private const val RANK_THRESHOLD = 0.45f  // RANK 模式平均分下限
+    private const val RANK_MIN_CONDITION = 0.2f
 
     data class SearchResult(
         val photo: PhotoItem,
         val score: Float,
         val matchedConditions: List<String>,
-        val matchSource: String = "" // For debugging: "description", "vlmKeywords", "tags", "labels"
+        val matchSource: String = ""
+    )
+
+    private data class ConditionEval(
+        val condition: SearchCondition,
+        val hit: Boolean,        // 原始命中（未考虑 negated）
+        val effective: Boolean,  // 考虑 negated 后是否通过
+        val score: Float,
+        val source: String
     )
 
     fun search(
@@ -29,267 +45,116 @@ object SearchEngine {
     ): List<SearchResult> {
         if (intent.conditions.isEmpty()) return emptyList()
 
-        val results = photos.mapNotNull { photo ->
+        // 一次搜索内缓存概念提取，避免每张照片重复 normalize
+        val evidenceMap = HashMap<Long, Map<Concept, Float>>(metadataMap.size)
+        metadataMap.forEach { (id, metadata) ->
+            evidenceMap[id] = ConceptRegistry.fromMetadata(metadata)
+        }
+
+        return photos.mapNotNull { photo ->
             val metadata = metadataMap[photo.id] ?: return@mapNotNull null
+            val evidence = evidenceMap[photo.id] ?: emptyMap()
 
-            when (intent.logicOperator) {
-                LogicOperator.AND -> {
-                    val allMatch = intent.conditions.all { condition ->
-                        matchCondition(condition, metadata) != condition.negated
-                    }
-                    if (allMatch) {
-                        val (score, source) = calculateScore(intent.conditions, metadata)
-                        SearchResult(photo, score, intent.conditions.map { it.keywords.firstOrNull() ?: "" }, source)
-                    } else null
-                }
-                LogicOperator.OR -> {
-                    val anyMatch = intent.conditions.any { condition ->
-                        matchCondition(condition, metadata) != condition.negated
-                    }
-                    if (anyMatch) {
-                        val (score, source) = calculateScore(intent.conditions, metadata)
-                        SearchResult(photo, score, intent.conditions.map { it.keywords.firstOrNull() ?: "" }, source)
-                    } else null
-                }
+            val evals = intent.conditions.map { cond ->
+                val (hit, score, source) = evaluateCondition(cond, metadata, evidence)
+                ConditionEval(
+                    condition = cond,
+                    hit = hit,
+                    effective = if (cond.negated) !hit else hit,
+                    score = if (cond.negated) 0f else score,
+                    source = source
+                )
+            }
+
+            val negativeOk = evals.none { it.condition.negated && it.hit }
+            val positive = evals.filter { !it.condition.negated }
+
+            var total = 0f
+            var weight = 0f
+            positive.forEach {
+                total += it.score * it.condition.weight
+                weight += it.condition.weight
+            }
+            val avgScore = if (weight > 0f) total / weight else if (negativeOk) 0.5f else 0f
+
+            val pass = negativeOk && when (intent.logicOperator) {
+                LogicOperator.AND -> evals.all { it.effective }
+                // 排除条件只做否决，不参与 OR 命中判定（否则恒为真、全库返回）
+                LogicOperator.OR -> positive.any { it.effective } || positive.isEmpty()
                 LogicOperator.RANK -> {
-                    val (score, source) = calculateScore(intent.conditions, metadata)
-                    if (score > 0.05f) {
-                        SearchResult(photo, score, intent.conditions.map { it.keywords.firstOrNull() ?: "" }, source)
-                    } else null
+                    val minScore = positive.minOfOrNull { it.score } ?: 0f
+                    minScore >= RANK_MIN_CONDITION && avgScore >= RANK_THRESHOLD
                 }
             }
+
+            if (!pass || avgScore <= 0f) return@mapNotNull null
+
+            SearchResult(
+                photo = photo,
+                score = avgScore,
+                matchedConditions = intent.conditions.map { conditionLabel(it) },
+                matchSource = evals.maxByOrNull { it.score }?.source ?: ""
+            )
+        }.sortedByDescending { it.score }
+    }
+
+    private fun evaluateCondition(
+        condition: SearchCondition,
+        metadata: PhotoMetadata,
+        evidence: Map<Concept, Float>
+    ): Triple<Boolean, Float, String> {
+        val concept = condition.concept
+        if (concept != null) {
+            val w = evidence[concept] ?: 0f
+            if (w >= MIN_EVIDENCE) return Triple(true, w, "concept:${concept.name}")
         }
 
-        return results.sortedByDescending { it.score }
+        // 兜底：词表未收录的自定义关键词，使用严格匹配
+        var best = 0f
+        for (keyword in condition.keywords) {
+            if (strictMatch(keyword, metadata)) {
+                best = maxOf(best, 0.6f)
+                break
+            }
+        }
+        return if (best > 0f) Triple(true, best, "keyword") else Triple(false, 0f, "")
     }
 
     /**
-     * Check if a condition matches any level of the photo's metadata.
+     * 严格文本匹配：
+     * - 英文用词边界，中文要求整词包含且长度 >= 2
+     * - 不做双向 contains、不做字符集合重叠、不做 2 字子串模糊
+     * - 单字词只匹配 VLM 关键词/标签的完全相等项
      */
-    private fun matchCondition(condition: SearchCondition, metadata: PhotoMetadata): Boolean {
-        return condition.keywords.any { keyword ->
-            val kw = keyword.lowercase().trim()
-            if (kw.isEmpty()) return@any false
+    private fun strictMatch(keyword: String, metadata: PhotoMetadata): Boolean {
+        val kw = keyword.lowercase().trim()
+        if (kw.isEmpty()) return false
 
-            // Level 1: VLM description match (most powerful)
-            if (metadata.description.isNotBlank() && matchAgainstText(kw, metadata.description)) {
-                return@any true
-            }
+        val isAscii = Regex("^[a-z0-9 -]+$").matches(kw)
+        val wordPattern = if (isAscii) Regex("(?<![a-z])${Regex.escape(kw)}(?![a-z])") else null
 
-            // Level 2: VLM keywords match
-            if (metadata.vlmKeywords.any { vlmKw ->
-                val v = vlmKw.lowercase()
-                v.contains(kw) || kw.contains(v) || fuzzyMatch(kw, v)
-            }) {
-                return@any true
-            }
-
-            // Level 3: Searchable tags match
-            val tags = metadata.toSearchableTags()
-            if (tags.any { tag -> tag.contains(kw) || kw.contains(tag) || fuzzyMatch(kw, tag) }) {
-                return@any true
-            }
-
-            // Level 4: ML Kit labels match
-            if (metadata.labels.any { label ->
-                val lt = label.text.lowercase()
-                (lt.contains(kw) || kw.contains(lt)) && label.confidence >= condition.minConfidence
-            }) {
-                return@any true
-            }
-
-            false
-        }
-    }
-
-    /**
-     * Match a keyword against a long text (description).
-     * Returns true if the keyword appears in the text or is semantically close.
-     */
-    private fun matchAgainstText(keyword: String, text: String): Boolean {
-        val normalizedText = text.lowercase()
-
-        // Direct substring match
-        if (normalizedText.contains(keyword)) return true
-
-        // For Chinese keywords, check if key characters appear near each other
-        if (keyword.length >= 2) {
-            // Check 2-char substrings
-            for (i in 0..keyword.length - 2) {
-                val sub = keyword.substring(i, i + 2)
-                if (normalizedText.contains(sub)) return true
-            }
-        }
-
-        // Fuzzy match against words in the text
-        val words = normalizedText.split(Regex("[\\s，。、；！？,.\\s]+")).filter { it.length >= 2 }
-        for (word in words) {
-            if (fuzzyMatch(keyword, word)) return true
-        }
-
-        return false
-    }
-
-    /**
-     * Calculate a relevance score with source tracking.
-     * Returns (score, bestMatchSource).
-     */
-    private fun calculateScore(
-        conditions: List<SearchCondition>,
-        metadata: PhotoMetadata
-    ): Pair<Float, String> {
-        var totalScore = 0f
-        var totalWeight = 0f
-        var bestSource = "labels"
-        var bestSourceScore = 0f
-
-        for (condition in conditions) {
-            totalWeight += condition.weight
-
-            var conditionScore = 0.0
-            var conditionSource = "labels"
-
-            for (keyword in condition.keywords) {
-                val kw = keyword.lowercase().trim()
-                if (kw.isEmpty()) continue
-
-                var kwScore = 0.0
-
-                // Description match: highest score (0.8-1.0)
-                if (metadata.description.isNotBlank()) {
-                    val descScore = scoreDescriptionMatch(kw, metadata.description)
-                    if (descScore > kwScore) {
-                        kwScore = descScore
-                        conditionSource = "description"
-                    }
-                }
-
-                // VLM keywords match: high score (0.6-0.8)
-                val vlmKwScore = metadata.vlmKeywords.maxOfOrNull { vlmKw ->
-                    val v = vlmKw.lowercase()
-                    when {
-                        v == kw -> 0.8
-                        v.contains(kw) || kw.contains(v) -> 0.7
-                        fuzzyMatch(kw, v) -> 0.5
-                        else -> 0.0
-                    }
-                } ?: 0.0
-                if (vlmKwScore > kwScore) {
-                    kwScore = vlmKwScore
-                    conditionSource = "vlmKeywords"
-                }
-
-                // Tags match: medium score (0.4-0.6)
-                val tags = metadata.toSearchableTags()
-                val tagScore = tags.maxOfOrNull { tag ->
-                    when {
-                        tag == kw -> 0.6
-                        tag.contains(kw) || kw.contains(tag) -> 0.5
-                        fuzzyMatch(kw, tag) -> 0.3
-                        else -> 0.0
-                    }
-                } ?: 0.0
-                if (tagScore > kwScore) {
-                    kwScore = tagScore
-                    conditionSource = "tags"
-                }
-
-                // Label match: lower score (0.2-0.4)
-                val labelScore = metadata.labels.maxOfOrNull { label ->
-                    val lt = label.text.lowercase()
-                    if ((lt.contains(kw) || kw.contains(lt)) && label.confidence >= condition.minConfidence) {
-                        label.confidence.toDouble() * 0.4
-                    } else 0.0
-                } ?: 0.0
-                if (labelScore > kwScore) {
-                    kwScore = labelScore
-                    conditionSource = "labels"
-                }
-
-                conditionScore = maxOf(conditionScore, kwScore)
-            }
-
-            // Apply negation
-            val finalScore = if (condition.negated) {
-                (1.0 - conditionScore).toFloat()
+        fun hit(text: String): Boolean {
+            val t = text.lowercase()
+            return if (wordPattern != null) {
+                wordPattern.containsMatchIn(t)
             } else {
-                conditionScore.toFloat()
-            }
-
-            totalScore += finalScore * condition.weight
-
-            // Track best source
-            if (conditionScore > bestSourceScore) {
-                bestSourceScore = conditionScore.toFloat()
-                bestSource = conditionSource
+                t == kw || (kw.length >= 2 && t.contains(kw))
             }
         }
 
-        val normalizedScore = if (totalWeight > 0f) totalScore / totalWeight else 0f
-        return normalizedScore to bestSource
+        if (metadata.vlmKeywords.any { hit(it) }) return true
+        if (kw.length >= 2 && metadata.description.isNotBlank() && hit(metadata.description)) return true
+        return metadata.labels.any { it.confidence >= 0.5f && hit(it.text) }
     }
 
-    /**
-     * Score how well a keyword matches a description text.
-     */
-    private fun scoreDescriptionMatch(keyword: String, description: String): Double {
-        val desc = description.lowercase()
-
-        // Exact keyword in description
-        if (desc.contains(keyword)) {
-            // Longer keyword matches are more significant
-            val lengthBonus = (keyword.length / 10.0).coerceAtMost(0.2)
-            return 0.8 + lengthBonus
-        }
-
-        // For Chinese: check character overlap with nearby context
-        if (keyword.length >= 2) {
-            var matchedChars = 0
-            for (i in 0..keyword.length - 2) {
-                val sub = keyword.substring(i, i + 2)
-                if (desc.contains(sub)) matchedChars++
-            }
-            if (matchedChars > 0) {
-                val ratio = matchedChars.toFloat() / (keyword.length - 1)
-                return (ratio * 0.6).toDouble()
-            }
-        }
-
-        // Fuzzy match against words in description
-        val words = desc.split(Regex("[\\s，。、；！？,.\\s]+")).filter { it.length >= 2 }
-        val bestFuzzy = words.maxOfOrNull { word ->
-            if (fuzzyMatch(keyword, word)) 0.4 else 0.0
-        } ?: 0.0
-
-        return bestFuzzy
-    }
-
-    private fun fuzzyMatch(a: String, b: String): Boolean {
-        if (a.isEmpty() || b.isEmpty()) return false
-        if (a == b) return true
-
-        // For Chinese: check if any 2-char substring matches
-        if (a.length >= 2 && b.length >= 2) {
-            for (i in 0..a.length - 2) {
-                val sub = a.substring(i, i + 2)
-                if (b.contains(sub)) return true
-            }
-        }
-
-        // For English: check character overlap
-        val charsA = a.toCharArray().toSet()
-        val charsB = b.toCharArray().toSet()
-        val overlap = charsA.intersect(charsB).size.toFloat()
-        val maxLen = maxOf(charsA.size, charsB.size).toFloat()
-        return maxLen > 0 && (overlap / maxLen) > 0.6f
+    private fun conditionLabel(condition: SearchCondition): String {
+        val label = condition.concept?.name ?: condition.keywords.firstOrNull() ?: ""
+        return if (condition.negated) "非$label" else label
     }
 
     fun quickSearch(
         query: String,
         photos: List<PhotoItem>,
         metadataMap: Map<Long, PhotoMetadata>
-    ): List<SearchResult> {
-        val intent = IntentParser.parse(query)
-        return search(intent, photos, metadataMap)
-    }
+    ): List<SearchResult> = search(IntentParser.parse(query), photos, metadataMap)
 }

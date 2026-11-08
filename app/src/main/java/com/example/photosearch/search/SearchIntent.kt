@@ -1,8 +1,12 @@
 package com.example.photosearch.search
 
 /**
- * Represents a parsed search intent from natural language input.
- * Supports compound conditions with AND/OR/NOT logic.
+ * 解析后的搜索意图。
+ * 替换路径：app/src/main/java/com/example/photosearch/search/SearchIntent.kt
+ *
+ * 变更：SearchCondition 新增 concept 字段（规范概念 ID）。
+ * keywords 保留，仅用于词表未收录的自定义关键词兜底匹配。
+ * 其余字段保持原样，PhotoViewModel / UI 无需改动。
  */
 data class SearchIntent(
     val rawQuery: String,
@@ -13,26 +17,17 @@ data class SearchIntent(
 
 data class SearchCondition(
     val type: ConditionType,
-    val keywords: List<String>,          // Keywords to match against tags
-    val negated: Boolean = false,         // NOT condition
-    val minConfidence: Float = 0.3f,      // Minimum label confidence
-    val weight: Float = 1.0f             // Importance weight for scoring
+    val keywords: List<String> = emptyList(),   // 兜底文本词（严格匹配，不再双向 contains）
+    val concept: Concept? = null,               // 规范概念：检索的主依据
+    val negated: Boolean = false,
+    val minConfidence: Float = 0.3f,
+    val weight: Float = 1.0f
 )
 
 enum class ConditionType {
-    OBJECT,          // Specific object (car, dog, person)
-    SCENE,           // Scene type (beach, mountain, indoor)
-    ACTION,          // Action/activity (running, eating, swimming)
-    ATTRIBUTE,       // Attribute (shirtless, smiling, outdoor)
-    COLOR,           // Color-based search
-    COUNT,           // Quantity-based (multiple people, group)
-    TEXT_CONTENT,    // Photo contains text
-    TIME,            // Time-based (night, sunset)
-    COMPOSITE        // Composite condition (multiple sub-conditions)
+    OBJECT, SCENE, ACTION, ATTRIBUTE, COLOR, COUNT, TEXT_CONTENT, TIME, COMPOSITE
 }
 
 enum class LogicOperator {
-    AND,  // All conditions must match
-    OR,   // Any condition can match
-    RANK  // Rank by total score (soft matching)
+    AND, OR, RANK
 }
