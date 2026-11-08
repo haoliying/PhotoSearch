@@ -33,7 +33,21 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         // 授权成功后必须重新扫描：ViewModel 的首次加载发生在弹框之前，拿到的是空列表
-        if (granted) viewModel.reloadPhotos()
+        if (granted) {
+            requestMediaLocationPermission()
+            viewModel.reloadPhotos()
+        }
+    }
+
+    /**
+     * Android 10+ 分区存储下，读取照片里的 GPS 必须额外申请 ACCESS_MEDIA_LOCATION，
+     * 否则 MediaStore.setRequireOriginal() 会抛异常，只能拿到被涂改过的坐标。
+     * 拒绝也不影响使用：拍摄时间与内容检索仍然可用，只是地点为空。
+     */
+    private val mediaLocationLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) viewModel.reloadPhotos()   // 重新扫描以补齐 GPS
     }
 
     private val notificationPermissionLauncher = registerForActivityResult(
@@ -70,7 +84,9 @@ class MainActivity : ComponentActivity() {
                                 onShare = { sharePhoto(state.selectedPhoto!!) },
                                 onReanalyze = { viewModel.reanalyzePhoto(state.selectedPhoto!!) },
                                 isReanalyzing = state.reanalyzingPhoto,
-                                reanalyzeError = state.reanalyzeError
+                                reanalyzeError = state.reanalyzeError,
+                                exif = state.selectedPhoto?.let { state.exifMap[it.id] },
+                                onSetPlaceLabel = { id, label -> viewModel.setPlaceLabel(id, label) }
                             )
                         }
                         else -> {
@@ -106,7 +122,21 @@ class MainActivity : ComponentActivity() {
                                 onExitSelection = { viewModel.exitSelectionMode() },
                                 onToggleSelection = { viewModel.togglePhotoSelection(it) },
                                 onSelectAll = { viewModel.selectAllFiltered() },
-                                onBatchReanalyze = { viewModel.reanalyzeSelectedPhotos() }
+                                onBatchReanalyze = { viewModel.reanalyzeSelectedPhotos() },
+                                // v3.6.0 时间 / 地点联动筛选
+                                timeRange = state.timeRange,
+                                locationQuery = state.locationQuery,
+                                availablePlaces = state.availablePlaces,
+                                filterSummary = state.filterSummary,
+                                isExtractingExif = state.isExtractingExif,
+                                exifProgress = state.exifProgress,
+                                exifTotal = state.exifTotal,
+                                noTimeCount = state.noTimeCount,
+                                noLocationCount = state.noLocationCount,
+                                onTimeRangeChange = { viewModel.setTimeRange(it) },
+                                onLocationQueryChange = { viewModel.setLocationQuery(it) },
+                                onSelectPlace = { viewModel.selectPlace(it) },
+                                onClearFilters = { viewModel.clearFilters() }
                             )
                         }
                     }
@@ -135,6 +165,8 @@ class MainActivity : ComponentActivity() {
         val perm = photoPermission()
         if (ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED) {
             permissionLauncher.launch(perm)
+        } else {
+            requestMediaLocationPermission()
         }
 
         // Notification permission (Android 13+)
@@ -142,6 +174,15 @@ class MainActivity : ComponentActivity() {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
+        }
+    }
+
+    private fun requestMediaLocationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_MEDIA_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            mediaLocationLauncher.launch(Manifest.permission.ACCESS_MEDIA_LOCATION)
         }
     }
 

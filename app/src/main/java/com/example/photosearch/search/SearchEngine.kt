@@ -1,5 +1,6 @@
 package com.example.photosearch.search
 
+import com.example.photosearch.data.PhotoExif
 import com.example.photosearch.data.PhotoItem
 import com.example.photosearch.data.PhotoMetadata
 
@@ -7,12 +8,12 @@ import com.example.photosearch.data.PhotoMetadata
  * 检索引擎。
  *
  * v3.5.0 修复精确率：删除 fuzzyMatch / 2 字子串 / 双向 contains / 排除条件反向加分。
- * v3.5.2 修复召回率：在概念通道之外增加「全文通道」，把 VLM 描述/关键词、
- * ML Kit 标签（含中文翻译）、对象检测、场景、人脸等信号编入索引，用完整词
- * 匹配覆盖词表外的任意查询词；同时不再丢弃没有分析结果的照片。
+ * v3.5.2 修复召回率：概念通道 + 全文通道双路检索。
+ * v3.6.0 新增时空联动：时间区间、地点（模糊 / 半径）作为硬过滤条件，
+ *         与内容条件按 AND 组合；只有筛选器时返回全部通过过滤的照片。
  *
- * 全文通道仍然严格：不做子串模糊、不做双向 contains、中文词元 >= 2 字、
- * 英文词元 >= 3 字母且词边界、长词优先命中即停止。
+ * 时间来源优先级：EXIF DateTimeOriginal > 文件名时间戳 > MediaStore DATE_TAKEN。
+ * 无时间或时间落在区间外的照片不参与时间筛选；无地点信息的照片不参与地点筛选。
  */
 object SearchEngine {
 
@@ -20,6 +21,7 @@ object SearchEngine {
     private const val TEXT_MIN_EVIDENCE = 0.55f // 全文通道证据强度下限
     private const val RANK_THRESHOLD = 0.45f    // RANK 模式平均分下限
     private const val RANK_MIN_CONDITION = 0.2f
+    private const val FILTER_ONLY_SCORE = 0.6f  // 纯筛选结果的固定分
 
     data class SearchResult(
         val photo: PhotoItem,
@@ -39,11 +41,37 @@ object SearchEngine {
     fun search(
         intent: SearchIntent,
         photos: List<PhotoItem>,
-        metadataMap: Map<Long, PhotoMetadata>
+        metadataMap: Map<Long, PhotoMetadata>,
+        exifMap: Map<Long, PhotoExif> = emptyMap()
     ): List<SearchResult> {
-        if (intent.conditions.isEmpty()) return emptyList()
+        if (intent.conditions.isEmpty() && !intent.hasFilters) return emptyList()
 
         return photos.mapNotNull { photo ->
+            val exif = exifMap[photo.id]
+
+            // ---- 硬过滤 1：时间区间 ----
+            val time = intent.timeRange
+            if (time != null) {
+                val t = effectiveTime(photo, exif)
+                if (t <= 0L || !time.contains(t)) return@mapNotNull null
+            }
+
+            // ---- 硬过滤 2：地点（模糊 / 半径） ----
+            val loc = intent.locationQuery
+            if (loc != null) {
+                if (exif == null || !LocationMatcher.matches(exif, loc)) return@mapNotNull null
+            }
+
+            // ---- 只有时间/地点筛选，没有内容词 ----
+            if (intent.filtersOnly) {
+                return@mapNotNull SearchResult(
+                    photo = photo,
+                    score = FILTER_ONLY_SCORE,
+                    matchedConditions = filterLabels(intent),
+                    matchSource = "filters"
+                )
+            }
+
             // 修复：分析失败/尚未分析的照片不再直接丢弃，至少用 PhotoItem 的标签参与检索
             val metadata = metadataMap[photo.id] ?: PhotoMetadata(
                 photoId = photo.id,
@@ -51,7 +79,7 @@ object SearchEngine {
                 isAnalyzed = false
             )
             val evidence = ConceptRegistry.fromMetadata(metadata)
-            val index = ConceptRegistry.buildSearchIndex(metadata)
+            val index = ConceptRegistry.buildSearchIndex(metadata, exif)
 
             val evals = intent.conditions.map { cond ->
                 val (hit, score, source) = evaluateCondition(cond, metadata, evidence, index)
@@ -90,10 +118,28 @@ object SearchEngine {
             SearchResult(
                 photo = photo,
                 score = avgScore,
-                matchedConditions = intent.conditions.map { conditionLabel(it) },
+                matchedConditions = intent.conditions.map { conditionLabel(it) } + filterLabels(intent),
                 matchSource = evals.maxByOrNull { it.score }?.source ?: ""
             )
         }.sortedByDescending { it.score }
+    }
+
+    /** 时间单位归一：部分厂商把 DATE_TAKEN 写成秒。 */
+    private fun effectiveTime(photo: PhotoItem, exif: PhotoExif?): Long {
+        if (exif != null && exif.hasTime) return exif.dateTaken
+        val t = photo.dateTaken
+        return when {
+            t <= 0L -> 0L
+            t < 100_000_000_000L -> t * 1000L
+            else -> t
+        }
+    }
+
+    private fun filterLabels(intent: SearchIntent): List<String> {
+        val out = mutableListOf<String>()
+        intent.timeRange?.let { out += "时间:${it.label.ifBlank { TimeQueryParser.format(it) }}" }
+        intent.locationQuery?.let { out += "地点:${it.raw}" }
+        return out
     }
 
     private fun evaluateCondition(
@@ -110,7 +156,6 @@ object SearchEngine {
         }
 
         // 排除条件：只用严格关键词匹配做否决，不启用全文通道
-        // （索引已 scrub 掉否定短语，避免「画面中没有汽车」被误判为含汽车）
         if (condition.negated) {
             for (keyword in condition.keywords) {
                 if (strictMatch(keyword, metadata)) return Triple(true, 0.6f, "keyword")
@@ -118,8 +163,7 @@ object SearchEngine {
             return Triple(false, 0f, "")
         }
 
-        // 通道 2：全文检索（召回词表外的词）。
-        // 只用本条件自己的词元，避免多条件查询时串味；长词优先、命中即停。
+        // 通道 2：全文检索（召回词表外的词，含 EXIF 地名/年份）。
         val terms = condition.keywords.distinct().sortedByDescending { it.length }
         for (term in terms) {
             val s = index.score(term)
@@ -163,5 +207,12 @@ object SearchEngine {
         query: String,
         photos: List<PhotoItem>,
         metadataMap: Map<Long, PhotoMetadata>
-    ): List<SearchResult> = search(IntentParser.parse(query), photos, metadataMap)
+    ): List<SearchResult> = search(IntentParser.parse(query), photos, metadataMap, emptyMap())
+
+    fun quickSearch(
+        query: String,
+        photos: List<PhotoItem>,
+        metadataMap: Map<Long, PhotoMetadata>,
+        exifMap: Map<Long, PhotoExif>
+    ): List<SearchResult> = search(IntentParser.parse(query), photos, metadataMap, exifMap)
 }

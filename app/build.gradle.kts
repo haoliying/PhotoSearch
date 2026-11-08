@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.photosearch"
         minSdk = 26
         targetSdk = 34
-        versionCode = 8
-        versionName = "3.5.2"
+        versionCode = 9
+        versionName = "3.6.0"
     }
 
     buildTypes {
@@ -60,6 +60,9 @@ dependencies {
 
     // Coil for image loading in Compose
     implementation("io.coil-kt:coil-compose:2.5.0")
+
+    // EXIF (拍摄时间 / GPS)，Jetpack 版本支持从 InputStream 读取且兼容高分屏旋转
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")

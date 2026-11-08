@@ -11,6 +11,10 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -20,6 +24,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.example.photosearch.data.PhotoExif
 import com.example.photosearch.data.PhotoItem
 import com.example.photosearch.data.PhotoMetadata
 import com.example.photosearch.data.SceneType
@@ -35,7 +40,9 @@ fun PhotoDetailScreen(
     onShare: () -> Unit,
     onReanalyze: () -> Unit = {},
     isReanalyzing: Boolean = false,
-    reanalyzeError: String? = null
+    reanalyzeError: String? = null,
+    exif: PhotoExif? = null,
+    onSetPlaceLabel: (Long, String) -> Unit = { _, _ -> }
 ) {
     Scaffold(
         topBar = {
@@ -90,11 +97,108 @@ fun PhotoDetailScreen(
                     Spacer(modifier = Modifier.height(4.dp))
 
                     val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+                    val fallbackTime = if (photo.dateTaken > 0L && photo.dateTaken < 100_000_000_000L)
+                        photo.dateTaken * 1000L else photo.dateTaken
+                    val displayTime = if (exif != null && exif.hasTime) exif.dateTaken else fallbackTime
                     Text(
-                        text = dateFormat.format(Date(photo.dateTaken)),
+                        text = if (displayTime > 0L) dateFormat.format(Date(displayTime)) else "拍摄时间未知",
                         style = MaterialTheme.typography.bodyMedium,
                         color = OnSurface.copy(alpha = 0.6f)
                     )
+
+                    // v3.6.0：EXIF 时间 / 地点信息与手动标注入口
+                    if (exif != null) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Divider()
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        var showPlaceDialog by remember { mutableStateOf(false) }
+                        var placeInput by remember(exif.manualLabel) {
+                            mutableStateOf(exif.manualLabel)
+                        }
+
+                        Text(
+                            "拍摄信息（EXIF）",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = Primary
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        InfoRow("时间来源", when (exif.dateSource) {
+                            "exif" -> "照片 EXIF"
+                            "filename" -> "文件名推断"
+                            "mediastore" -> "系统相册记录"
+                            else -> "未知"
+                        })
+                        Spacer(modifier = Modifier.height(6.dp))
+                        if (exif.hasGps) {
+                            InfoRow(
+                                "GPS 坐标",
+                                String.format(Locale.US, "%.4f, %.4f", exif.latitude!!, exif.longitude!!)
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                        }
+                        InfoRow("地点来源", when (exif.placeSource) {
+                            "geocoder" -> "系统逆地理编码"
+                            "gps-city" -> "GPS 城市匹配"
+                            "manual" -> "手动标注"
+                            else -> "未记录"
+                        })
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("拍摄地点", style = MaterialTheme.typography.bodySmall, color = OnSurface.copy(alpha = 0.6f))
+                            TextButton(onClick = { showPlaceDialog = true }) {
+                                Text(if (exif.hasPlace) "修改" else "+ 手动标注", fontSize = 12.sp)
+                            }
+                        }
+                        Text(
+                            text = if (exif.hasPlace) exif.placeLabel() else "未记录。手动标注后即可按地点搜索这张照片。",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (exif.hasPlace) OnSurface else OnSurface.copy(alpha = 0.5f)
+                        )
+
+                        if (showPlaceDialog) {
+                            AlertDialog(
+                                onDismissRequest = { showPlaceDialog = false },
+                                title = { Text("设置拍摄地点") },
+                                text = {
+                                    Column {
+                                        Text(
+                                            "用于按地点检索这张照片。手动标注会覆盖 GPS 解析结果；留空可清除标注。",
+                                            fontSize = 12.sp,
+                                            color = OnSurface.copy(alpha = 0.7f)
+                                        )
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        OutlinedTextField(
+                                            value = placeInput,
+                                            onValueChange = { placeInput = it },
+                                            placeholder = { Text("例如：杭州西湖 / 北京市朝阳区", fontSize = 12.sp) },
+                                            singleLine = true,
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                    }
+                                },
+                                confirmButton = {
+                                    TextButton(onClick = {
+                                        onSetPlaceLabel(photo.id, placeInput)
+                                        showPlaceDialog = false
+                                    }) { Text("保存") }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showPlaceDialog = false }) { Text("取消") }
+                                }
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Divider()
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
 
                     val metadata = photo.metadata
 

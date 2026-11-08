@@ -14,5 +14,8 @@ data class PhotoItem(
     val displayName: String,
     val labels: List<PhotoLabel> = emptyList(),
     val metadata: PhotoMetadata? = null,
-    val isAnalyzed: Boolean = false
+    val isAnalyzed: Boolean = false,
+    // v3.6.0：MediaStore 层的经纬度兜底（Android 9 及以下有效；Q+ 由 EXIF 原始流读取）
+    val latitude: Double? = null,
+    val longitude: Double? = null
 )

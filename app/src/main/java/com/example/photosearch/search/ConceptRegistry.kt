@@ -1,6 +1,7 @@
 package com.example.photosearch.search
 
 import com.example.photosearch.data.LabelTranslator
+import com.example.photosearch.data.PhotoExif
 import com.example.photosearch.data.PhotoMetadata
 import com.example.photosearch.data.SceneType
 
@@ -35,10 +36,12 @@ object ConceptRegistry {
      * 本身也会被抹掉，导致 BICYCLE 永远无法命中、用户搜自行车 0 结果。
      */
     private val CAR_CONFUSABLES: List<String> = listOf(
-        "自行车", "摩托车", "电动车", "火车站", "停车场", "汽车模型", "玩具车",
+        // v3.6.0：补「单车 / 脚踏车」——BICYCLE 的别名含单字「车」，
+        // 不屏蔽会让「汽车」查询把自行车照片召回（CAR 词表里有单字「车」）。
+        "自行车", "单车", "脚踏车", "骑行", "摩托车", "电动车", "火车站", "停车场", "汽车模型", "玩具车",
         "车库", "车站", "车票", "车轮", "轮胎", "车模", "堵车", "车间",
         "修车", "车流", "站台", "车棚", "车牌", "车窗", "车厢", "下车", "车上",
-        "bicycle", "bike", "garage", "parking", "train station", "toy car", "model car"
+        "bicycle", "bike", "cycling", "garage", "parking", "train station", "toy car", "model car"
     ).sortedByDescending { it.length }
 
     private val NEGATION_PREFIXES = listOf("没有", "无", "不含", "看不到", "并非", "不是", "未出现")
@@ -128,8 +131,10 @@ object ConceptRegistry {
         "画面里", "这张", "照片", "图片", "画面", "图像", "整体氛围", "主要内容"
     ).sortedByDescending { it.length }
 
+    // 注意：不要放单字「无」——它会把「无锡」「芜湖」这类地名从索引里抹掉。
+    // 明确的否定词（没有/不含/看不到…）足以覆盖 VLM 描述里的否定表述。
     private val NEGATION_REGEX = Regex(
-        "(?:没有|并无|不含|看不到|并非|不是|未出现|无)\\s*([\\u4e00-\\u9fa5a-zA-Z]{1,12})"
+        "(?:没有|并无|不含|看不到|并非|不是|未出现)\\s*([\\u4e00-\\u9fa5a-zA-Z]{1,12})"
     )
     private val UNCERTAIN_REGEX = Regex(
         "(?:看起来像|疑似|可能是|似乎是|仿佛|有点像|像是|好像是)\\s*([\\u4e00-\\u9fa5]{1,12})"
@@ -317,8 +322,12 @@ object ConceptRegistry {
         }
     }
 
-    /** 把一张照片的所有可用信号编成全文索引（不需要重新分析即可生效）。 */
-    fun buildSearchIndex(m: PhotoMetadata): SearchIndex {
+    /**
+     * 把一张照片的所有可用信号编成全文索引（不需要重新分析即可生效）。
+     * v3.6.0：可选传入 EXIF，把地点名称与拍摄年/月也纳入全文通道，
+     * 这样即使自然语言里没被解析成结构化筛选，输入「北京」「2023」也能命中。
+     */
+    fun buildSearchIndex(m: PhotoMetadata, exif: PhotoExif? = null): SearchIndex {
         val entries = mutableListOf<Pair<String, Float>>()
         fun add(text: String, weight: Float) {
             val s = scrub(text)
@@ -370,6 +379,22 @@ object ConceptRegistry {
             true -> listOf("户外", "室外", "outdoor").forEach { add(it, 0.50f) }
             false -> listOf("室内", "indoor", "room").forEach { add(it, 0.50f) }
             null -> Unit
+        }
+
+        // ---- v3.6.0：EXIF 时空信息进入全文索引 ----
+        if (exif != null) {
+            val loc = exif.searchableLocation()
+            if (loc.isNotBlank()) {
+                add(loc, 0.85f)
+                loc.split(Regex("""\s+""")).filter { it.length >= 2 }.forEach { add(it, 0.85f) }
+            }
+            if (exif.hasTime) {
+                val cal = java.util.Calendar.getInstance().apply { timeInMillis = exif.dateTaken }
+                val y = cal.get(java.util.Calendar.YEAR)
+                val mo = cal.get(java.util.Calendar.MONTH) + 1
+                val mm = String.format(java.util.Locale.US, "%02d", mo)
+                listOf("$y", "${y}年", "${y}年${mo}月", "$y-$mm").forEach { add(it, 0.70f) }
+            }
         }
         return SearchIndex(entries)
     }
