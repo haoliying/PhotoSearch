@@ -43,6 +43,18 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      # 首次运行（Gradle 缓存未命中时）需要下载 gradle-8.2-bin.zip（约 100MB），
+      # services.gradle.org 偶发慢/中断；先单独预热并重试，避免整次构建直接失败。
+      - name: Warm up Gradle wrapper (with retry)
+        run: |
+          for i in 1 2 3; do
+            ./gradlew --version && exit 0
+            echo "gradle wrapper attempt $i failed, retrying in 5s..."
+            sleep 5
+          done
+          echo "gradle wrapper warm-up failed after 3 attempts"
+          exit 1
+
       - name: Build unsigned release APK
         run: |
           [ -f app/proguard-rules.pro ] || touch app/proguard-rules.pro
@@ -92,5 +104,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "PhotoSearch $TAG" \
-            --notes "修复照片搜索准确度：重写检索层，移除导致任意查询几乎返回整个相册的模糊匹配（fuzzyMatch 2 字符子串、双向 contains、排除条件反向加分等）。离线仿真宏平均精确率 0.10 -> 0.90。APK 已使用固定自签名证书签名，可直接安装；根因与后续优化路线见仓库 docs/SEARCH_ACCURACY.md。"
+            --notes "PhotoSearch $TAG 发布。APK 使用固定自签名证书签名，可直接覆盖安装（请勿更换签名密钥）。本次变更、诊断与验证说明见仓库 docs/ 目录（SEARCH_ACCURACY.md / SEARCH_RECALL.md / EXIF_SEARCH.md）。"
           echo "Released $TAG"
