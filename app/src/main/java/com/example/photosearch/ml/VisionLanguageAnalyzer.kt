@@ -3,6 +3,8 @@ package com.example.photosearch.ml
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import android.util.Base64
 import com.example.photosearch.data.AppConfig
@@ -62,11 +64,11 @@ class VisionLanguageAnalyzer(private val context: Context) {
             ),
             ProviderConfig(
                 id = "deepseek",
-                displayName = "DeepSeek (免费额度)",
+                displayName = "DeepSeek (不支持图片，勿选)",
                 apiUrl = "https://api.deepseek.com/chat/completions",
                 modelName = "deepseek-chat",
                 apiKeyUrl = "https://platform.deepseek.com/api_keys",
-                freeInfo = "注册后有免费额度"
+                freeInfo = "deepseek-chat 是纯文本模型，无法分析图片；请改用智谱AI / 通义千问 / 硅基流动"
             ),
             ProviderConfig(
                 id = "siliconflow",
@@ -97,6 +99,10 @@ class VisionLanguageAnalyzer(private val context: Context) {
 
             if (apiKey.isBlank()) {
                 return@withContext VlmResult("", emptyList(), false, "API Key 未配置")
+            }
+            if (providerId == "deepseek") {
+                return@withContext VlmResult("", emptyList(), false,
+                    "DeepSeek 是纯文本模型，无法分析图片；请在设置里改用智谱AI / 通义千问 / 硅基流动")
             }
 
             try {
@@ -201,7 +207,33 @@ class VisionLanguageAnalyzer(private val context: Context) {
 
     private fun parseVlmText(text: String): VlmResult {
         val cleaned = text.trim()
-            .removePrefix("```").removeSuffix("```").trim()
+            .removePrefix("```json").removePrefix("```JSON").removePrefix("```")
+            .removeSuffix("```").trim()
+
+        // 优先解析结构化 JSON（v3.5.2 提示词格式）
+        val jsonStart = cleaned.indexOf('{')
+        val jsonEnd = cleaned.lastIndexOf('}')
+        if (jsonStart >= 0 && jsonEnd > jsonStart) {
+            try {
+                val obj = JSONObject(cleaned.substring(jsonStart, jsonEnd + 1))
+                val desc = obj.optString("description", "").trim()
+                val kws = mutableListOf<String>()
+                for (key in listOf("keywords", "objects", "attributes", "scene")) {
+                    when (val v = obj.opt(key)) {
+                        is JSONArray -> for (i in 0 until v.length()) {
+                            val s = v.optString(i, "").trim()
+                            if (s.isNotBlank()) kws += s
+                        }
+                        is String -> if (v.isNotBlank()) kws += v.trim()
+                    }
+                }
+                if (desc.isNotBlank() || kws.isNotEmpty()) {
+                    return VlmResult(desc, kws.distinct(), true)
+                }
+            } catch (_: Exception) {
+                // 模型没按 JSON 输出，回退到自由文本解析
+            }
+        }
 
         var description = ""
         var keywords = listOf<String>()
@@ -281,7 +313,7 @@ class VisionLanguageAnalyzer(private val context: Context) {
 
     private fun loadAndResizeBitmap(uri: Uri): Bitmap? {
         return try {
-            context.contentResolver.openInputStream(uri)?.use { inputStream ->
+            val bitmap = context.contentResolver.openInputStream(uri)?.use { inputStream ->
                 val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 BitmapFactory.decodeStream(inputStream, null, options)
                 inputStream.close()
@@ -297,9 +329,41 @@ class VisionLanguageAnalyzer(private val context: Context) {
                     BitmapFactory.decodeStream(stream, null, decodeOptions)
                 }
             }
+            if (bitmap == null) null else rotateByExif(uri, bitmap)
         } catch (e: Exception) {
             e.printStackTrace()
             null
+        }
+    }
+
+    /**
+     * 应用 EXIF 旋转。BitmapFactory.decodeStream 不会自动处理 orientation，
+     * 竖拍照片会「躺着」送进 VLM / ML Kit，物体与文字识别质量明显下降。
+     */
+    @Suppress("DEPRECATION")
+    private fun rotateByExif(uri: Uri, bitmap: Bitmap): Bitmap {
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                val exif = ExifInterface(input)
+                val degrees = when (exif.getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL
+                )) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                    ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                    ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                    else -> 0f
+                }
+                if (degrees == 0f) bitmap else {
+                    val matrix = Matrix().apply { postRotate(degrees) }
+                    val rotated = Bitmap.createBitmap(
+                        bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
+                    )
+                    if (rotated !== bitmap) bitmap.recycle()
+                    rotated
+                }
+            } ?: bitmap
+        } catch (e: Exception) {
+            bitmap
         }
     }
 
@@ -317,17 +381,13 @@ class VisionLanguageAnalyzer(private val context: Context) {
         return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
     }
 
-    private val ANALYSIS_PROMPT = """请仔细观察这张照片，然后用以下格式回复：
+    private val ANALYSIS_PROMPT = """你是一个照片索引器，为「按内容搜照片」建立索引。只描述画面中确实可见的内容。
+严格输出一个 JSON 对象，不要输出 JSON 以外的任何文字，不要用代码块包裹：
+{"description":"用中文一到两句话客观描述画面主体、场景、人物动作、衣着与显著物体","objects":["画面中确实存在的具体物体名称，用中文常用名词，例如 轿车、咖啡杯、笔记本电脑、雨伞、气球、篮球、书本、猫"],"scene":"场景类型，例如 室内、户外、海滩、山景、城市街道、餐厅、夜景","attributes":["显著属性，例如 夜晚、下雪、多人合影、光着上身、微笑"],"keywords":["8 到 20 个可用于检索的中文关键词，必须来自上面各项，尽量覆盖所有可搜索内容"]}
 
-描述：用中文详细描述这张照片的内容，包括：
-1. 场景中有什么（物体、建筑、自然景观等）
-2. 人物在做什么、穿什么衣服、什么表情
-3. 这是什么地方（如果能识别出具体地点请说明，比如泰山、长城、某个海滩等）
-4. 什么时间（白天/夜晚、什么季节）
-5. 天气和环境
-6. 整体氛围
-
-关键词：列出10-20个关键词，用逗号分隔，涵盖照片中的物体、人物、场景、活动、颜色等
-
-注意：描述要尽量详细准确，关键词要覆盖所有可搜索的内容。如果照片中有人光着上身/没穿上衣，请在描述和关键词中明确说明。""".trimIndent()
+规则：
+- 只写画面里真实存在的东西。看到山不要写「泰山」，除非画面里有可辨认的文字标识；不要猜品牌、地名、人名。
+- 物体名必须用具体名词，不要用「物体」「东西」「物品」「景观」这类泛称，否则用户搜不到。
+- 若画面中有人光着上身 / 没穿上衣，必须在 attributes 和 keywords 里写「光膀子」。
+- 描述开头不要写「这张照片」「画面中」这类套话。""".trimIndent()
 }

@@ -3,7 +3,9 @@ package com.example.photosearch.ml
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.Color as AndroidColor
+import android.media.ExifInterface
 import android.net.Uri
 import com.example.photosearch.data.*
 import com.google.mlkit.vision.common.InputImage
@@ -122,7 +124,7 @@ class EnhancedImageAnalyzer(context: Context) {
 
     private fun loadBitmap(uri: Uri, context: Context): Bitmap? {
         return try {
-            context.contentResolver.openInputStream(uri)?.use { inputStream ->
+            val bitmap = context.contentResolver.openInputStream(uri)?.use { inputStream ->
                 // First pass: get dimensions
                 val options = BitmapFactory.Options().apply {
                     inJustDecodeBounds = true
@@ -141,9 +143,38 @@ class EnhancedImageAnalyzer(context: Context) {
                     BitmapFactory.decodeStream(stream, null, decodeOptions)
                 }
             }
+            if (bitmap == null) null else rotateByExif(uri, bitmap, context)
         } catch (e: Exception) {
             e.printStackTrace()
             null
+        }
+    }
+
+    /** 应用 EXIF 旋转，避免竖拍照片横躺着送入 ML Kit。 */
+    @Suppress("DEPRECATION")
+    private fun rotateByExif(uri: Uri, bitmap: Bitmap, context: Context): Bitmap {
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                val exif = ExifInterface(input)
+                val degrees = when (exif.getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL
+                )) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                    ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                    ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                    else -> 0f
+                }
+                if (degrees == 0f) bitmap else {
+                    val matrix = Matrix().apply { postRotate(degrees) }
+                    val rotated = Bitmap.createBitmap(
+                        bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
+                    )
+                    if (rotated !== bitmap) bitmap.recycle()
+                    rotated
+                }
+            } ?: bitmap
+        } catch (e: Exception) {
+            bitmap
         }
     }
 

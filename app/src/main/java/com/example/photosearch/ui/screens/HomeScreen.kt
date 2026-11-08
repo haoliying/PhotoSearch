@@ -442,17 +442,25 @@ private fun AnalysisSection(
                     }
                 }
                 hasAnalyzed -> {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        Icon(Icons.Default.CheckCircle, null, tint = Secondary, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            "分析完成，可以搜索照片内容",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Secondary
-                        )
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Icon(Icons.Default.CheckCircle, null, tint = Secondary, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                "分析完成，可以搜索照片内容",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Secondary
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        TextButton(onClick = onRestartAnalysis) {
+                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("重新分析全部（更换模型 / Key 后使用）", fontSize = 12.sp)
+                        }
                     }
                 }
             }

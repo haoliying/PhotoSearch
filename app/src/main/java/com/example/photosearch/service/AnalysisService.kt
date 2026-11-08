@@ -170,6 +170,10 @@ class AnalysisService : Service() {
                             analyzedMetadata[photo.id] = metadata
                         } catch (e: Exception) {
                             Log.e(TAG, "分析照片失败 [${photo.id}]", e)
+                            // 即使本地分析失败也写入占位结果，保证照片在检索时不会被直接丢弃
+                            analyzedMetadata[photo.id] = PhotoMetadata(
+                                photoId = photo.id, isAnalyzed = true
+                            )
                         }
 
                         val current = processedCount.incrementAndGet()
@@ -232,12 +236,13 @@ class AnalysisService : Service() {
             }
 
             updateState(isRunning = false, isComplete = true, isResumed = false, vlmEnabled = useVlm, vlmErrors = vlmErrorCount.get())
-            val completeMsg = if (useVlm && vlmErrorCount.get() == 0) {
-                "分析完成（含AI描述）${photos.size}/${photos.size}"
-            } else if (useVlm) {
-                "分析完成 ${photos.size}/${photos.size} (VLM错误:${vlmErrorCount.get()})"
-            } else {
-                "分析完成 ${photos.size}/${photos.size}"
+            val completeMsg = when {
+                useVlm && vlmErrorCount.get() == 0 ->
+                    "分析完成（含AI描述）${photos.size}/${photos.size}"
+                useVlm ->
+                    "分析完成，但 ${vlmErrorCount.get()} 张缺少AI描述：请检查设置里的模型与 API Key，然后点「重新分析全部」"
+                else ->
+                    "分析完成（仅本地标签）：开启 AI 描述可显著提升搜索效果"
             }
             updateNotification(completeMsg, photos.size, photos.size)
 

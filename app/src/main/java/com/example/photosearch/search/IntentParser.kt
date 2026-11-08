@@ -1,16 +1,14 @@
 package com.example.photosearch.search
 
 /**
- * 查询解析器（替换版）。
- * 替换路径：app/src/main/java/com/example/photosearch/search/IntentParser.kt
+ * 查询解析器。
  *
- * 相对原版的修复：
- * 1. 删除 24 个硬编码 IntentPattern（触发词 contains 单字「车」「人」会串味）。
- * 2. 英文 or / and 改为词边界 \bor\b / \band\b，
- *    修复「portrait」「forest」被拆成 "p"+"trait"、"f"+"est" 的致命 bug。
- * 3. 查询直接规范化为概念 ID，中英文同义词统一处理。
- * 4. 描述文案与实际使用的概念保持一致（原版 getDescription 取 first，
- *    parse 取 maxByOrNull，两者可能不一致）。
+ * v3.5.2 修复召回率：
+ * 1. 每个条件都带上该片段的查询词元（不再只给词表外的兜底条件填 keywords），
+ *    这样概念条件在概念通道未命中时也能走全文通道兜底。
+ * 2. 中文查询改用 ConceptRegistry.tokenizeQuery 切词（去停用词 + 2~4 gram），
+ *    修复「一杯咖啡」「有汽车的照片」被当成一整个关键词导致 0 结果的问题。
+ * 3. 词表外的词不再被静默丢弃。
  */
 object IntentParser {
 
@@ -38,16 +36,18 @@ object IntentParser {
 
         val conditions = mutableListOf<SearchCondition>()
         for (part in parts) {
+            val terms = ConceptRegistry.tokenizeQuery(part)
             val concepts = ConceptRegistry.normalize(part)
             if (concepts.isNotEmpty()) {
                 concepts.forEach { c ->
-                    conditions += SearchCondition(type = typeFor(c), concept = c)
+                    conditions += SearchCondition(
+                        type = typeFor(c),
+                        concept = c,
+                        keywords = terms
+                    )
                 }
-            } else {
-                val words = tokenize(part)
-                if (words.isNotEmpty()) {
-                    conditions += SearchCondition(type = ConditionType.COMPOSITE, keywords = words)
-                }
+            } else if (terms.isNotEmpty()) {
+                conditions += SearchCondition(type = ConditionType.COMPOSITE, keywords = terms)
             }
         }
 
@@ -68,7 +68,7 @@ object IntentParser {
 
         if (conditions.isEmpty()) return SearchIntent(query, emptyList())
 
-        val hasFallback = conditions.any { it.type == ConditionType.COMPOSITE && !it.negated }
+        val hasFallback = conditions.any { it.concept == null && !it.negated }
         val logic = when {
             isOr -> LogicOperator.OR
             hasFallback -> LogicOperator.RANK
@@ -92,11 +92,6 @@ object IntentParser {
         return positive to negations
     }
 
-    private fun tokenize(text: String): List<String> =
-        text.split(Regex("""[\s,，、;；!！?？]+"""))
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-
     private fun typeFor(c: Concept): ConditionType = when (c) {
         Concept.CAR, Concept.BICYCLE, Concept.BUS, Concept.CAT, Concept.DOG,
         Concept.FLOWER, Concept.FOREST, Concept.FOOD, Concept.BUILDING,
@@ -111,12 +106,17 @@ object IntentParser {
     fun getDescription(query: String): String? {
         val positive = extractNegations(query.trim()).first
         val concepts = ConceptRegistry.normalize(positive)
-        return if (concepts.isEmpty()) null else ConceptRegistry.descriptionOf(concepts)
+        if (concepts.isNotEmpty()) return ConceptRegistry.descriptionOf(concepts)
+        val terms = ConceptRegistry.tokenizeQuery(positive)
+            .filter { it.length >= 2 }
+            .sortedByDescending { it.length }
+            .take(3)
+        return if (terms.isEmpty()) null else "关键词匹配: ${terms.joinToString("、")}"
     }
 
     fun getSuggestions(): List<String> = listOf(
         "有车", "人物", "光膀子", "泰山", "海滩", "宠物", "美食", "建筑",
-        "风景", "夜景", "运动", "花卉", "自拍", "合影", "旅游", "日落",
-        "雪景", "婚礼", "宝宝", "室内"
+        "自行车", "咖啡", "笔记本电脑", "书", "夜景", "运动", "花卉",
+        "自拍", "合影", "日落", "雪景", "婚礼", "宝宝", "室内", "气球"
     )
 }

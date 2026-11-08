@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.photosearch"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "3.5.1"
+        versionCode = 8
+        versionName = "3.5.2"
     }
 
     buildTypes {

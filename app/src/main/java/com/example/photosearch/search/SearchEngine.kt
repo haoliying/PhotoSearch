@@ -4,23 +4,21 @@ import com.example.photosearch.data.PhotoItem
 import com.example.photosearch.data.PhotoMetadata
 
 /**
- * 检索引擎（替换版）。
- * 替换路径：app/src/main/java/com/example/photosearch/search/SearchEngine.kt
+ * 检索引擎。
  *
- * 相对原版的修复：
- * 1. 彻底删除 fuzzyMatch / matchAgainstText / 2 字子串 / 双向 contains。
- *    原版 fuzzyMatch 把 2 字符子串匹配用在英文上：'car' 的 'ca' 命中
- *    'landscape'、'vehicle' 的 'cl' 命中 'cloud'，导致搜「汽车」返回整个相册。
- * 2. 匹配单位由「自由文本」改为「规范概念 + 证据强度」。
- * 3. negation 不再用 (1 - score) 加分；命中排除项直接否决。
- * 4. RANK 阈值从 0.05 提到 0.45，并要求每个正向条件都拿到最低分。
- * 5. 不采信 toSearchableTags() 里的启发式推断标签
- *    （原版会把「海滩 + 人物」直接推断成「光膀子」）。
+ * v3.5.0 修复精确率：删除 fuzzyMatch / 2 字子串 / 双向 contains / 排除条件反向加分。
+ * v3.5.2 修复召回率：在概念通道之外增加「全文通道」，把 VLM 描述/关键词、
+ * ML Kit 标签（含中文翻译）、对象检测、场景、人脸等信号编入索引，用完整词
+ * 匹配覆盖词表外的任意查询词；同时不再丢弃没有分析结果的照片。
+ *
+ * 全文通道仍然严格：不做子串模糊、不做双向 contains、中文词元 >= 2 字、
+ * 英文词元 >= 3 字母且词边界、长词优先命中即停止。
  */
 object SearchEngine {
 
-    private const val MIN_EVIDENCE = 0.5f     // 概念证据强度下限
-    private const val RANK_THRESHOLD = 0.45f  // RANK 模式平均分下限
+    private const val MIN_EVIDENCE = 0.5f       // 概念证据强度下限
+    private const val TEXT_MIN_EVIDENCE = 0.55f // 全文通道证据强度下限
+    private const val RANK_THRESHOLD = 0.45f    // RANK 模式平均分下限
     private const val RANK_MIN_CONDITION = 0.2f
 
     data class SearchResult(
@@ -45,18 +43,18 @@ object SearchEngine {
     ): List<SearchResult> {
         if (intent.conditions.isEmpty()) return emptyList()
 
-        // 一次搜索内缓存概念提取，避免每张照片重复 normalize
-        val evidenceMap = HashMap<Long, Map<Concept, Float>>(metadataMap.size)
-        metadataMap.forEach { (id, metadata) ->
-            evidenceMap[id] = ConceptRegistry.fromMetadata(metadata)
-        }
-
         return photos.mapNotNull { photo ->
-            val metadata = metadataMap[photo.id] ?: return@mapNotNull null
-            val evidence = evidenceMap[photo.id] ?: emptyMap()
+            // 修复：分析失败/尚未分析的照片不再直接丢弃，至少用 PhotoItem 的标签参与检索
+            val metadata = metadataMap[photo.id] ?: PhotoMetadata(
+                photoId = photo.id,
+                labels = photo.labels,
+                isAnalyzed = false
+            )
+            val evidence = ConceptRegistry.fromMetadata(metadata)
+            val index = ConceptRegistry.buildSearchIndex(metadata)
 
             val evals = intent.conditions.map { cond ->
-                val (hit, score, source) = evaluateCondition(cond, metadata, evidence)
+                val (hit, score, source) = evaluateCondition(cond, metadata, evidence, index)
                 ConditionEval(
                     condition = cond,
                     hit = hit,
@@ -101,30 +99,39 @@ object SearchEngine {
     private fun evaluateCondition(
         condition: SearchCondition,
         metadata: PhotoMetadata,
-        evidence: Map<Concept, Float>
+        evidence: Map<Concept, Float>,
+        index: ConceptRegistry.SearchIndex
     ): Triple<Boolean, Float, String> {
+        // 通道 1：规范概念（精确率最高）
         val concept = condition.concept
         if (concept != null) {
             val w = evidence[concept] ?: 0f
             if (w >= MIN_EVIDENCE) return Triple(true, w, "concept:${concept.name}")
         }
 
-        // 兜底：词表未收录的自定义关键词，使用严格匹配
-        var best = 0f
-        for (keyword in condition.keywords) {
-            if (strictMatch(keyword, metadata)) {
-                best = maxOf(best, 0.6f)
-                break
+        // 排除条件：只用严格关键词匹配做否决，不启用全文通道
+        // （索引已 scrub 掉否定短语，避免「画面中没有汽车」被误判为含汽车）
+        if (condition.negated) {
+            for (keyword in condition.keywords) {
+                if (strictMatch(keyword, metadata)) return Triple(true, 0.6f, "keyword")
             }
+            return Triple(false, 0f, "")
         }
-        return if (best > 0f) Triple(true, best, "keyword") else Triple(false, 0f, "")
+
+        // 通道 2：全文检索（召回词表外的词）。
+        // 只用本条件自己的词元，避免多条件查询时串味；长词优先、命中即停。
+        val terms = condition.keywords.distinct().sortedByDescending { it.length }
+        for (term in terms) {
+            val s = index.score(term)
+            if (s >= TEXT_MIN_EVIDENCE) return Triple(true, s, "text:$term")
+        }
+        return Triple(false, 0f, "")
     }
 
     /**
      * 严格文本匹配：
      * - 英文用词边界，中文要求整词包含且长度 >= 2
      * - 不做双向 contains、不做字符集合重叠、不做 2 字子串模糊
-     * - 单字词只匹配 VLM 关键词/标签的完全相等项
      */
     private fun strictMatch(keyword: String, metadata: PhotoMetadata): Boolean {
         val kw = keyword.lowercase().trim()

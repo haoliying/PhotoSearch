@@ -285,7 +285,30 @@ object LabelTranslator {
         "palm" to listOf("棕榈树"),
         "snow" to listOf("雪", "雪景"),
         "rain" to listOf("雨", "下雨"),
-        "palm tree" to listOf("棕榈树")
+        "palm tree" to listOf("棕榈树"),
+        // v3.5.2：补充高频物体中文映射，供全文通道检索词表外的中文词
+        "book" to listOf("书", "书本", "书籍"),
+        "laptop" to listOf("笔记本电脑", "电脑", "笔记本"),
+        "coffee" to listOf("咖啡", "咖啡杯"),
+        "cup" to listOf("杯子", "咖啡杯"),
+        "balloon" to listOf("气球"),
+        "umbrella" to listOf("雨伞"),
+        "chair" to listOf("椅子"),
+        "table" to listOf("桌子", "木桌"),
+        "phone" to listOf("手机"),
+        "camera" to listOf("相机"),
+        "bottle" to listOf("瓶子", "水瓶"),
+        "wine" to listOf("红酒", "酒"),
+        "street" to listOf("街道", "马路"),
+        "road" to listOf("道路", "公路"),
+        "train" to listOf("火车"),
+        "airplane" to listOf("飞机"),
+        "boat" to listOf("船", "小船"),
+        "river" to listOf("河", "河流"),
+        "lake" to listOf("湖", "湖泊"),
+        "grass" to listOf("草", "草地"),
+        "sky" to listOf("天空"),
+        "cloud" to listOf("云", "云朵")
     )
 
     fun toChineseTags(englishLabel: String): List<String> {
