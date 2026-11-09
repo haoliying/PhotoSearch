@@ -12,6 +12,7 @@ object AppConfig {
     private const val KEY_API_KEY = "vlm_api_key"
     private const val KEY_API_PROVIDER = "vlm_api_provider"
     private const val KEY_USE_VLM = "use_vlm"
+    private const val KEY_AUTO_RESUME = "auto_resume_analysis"
     private const val DEFAULT_SEGMENT_SIZE = 200
 
     private fun prefs(context: Context): SharedPreferences {
@@ -52,5 +53,17 @@ object AppConfig {
 
     fun hasApiKey(context: Context): Boolean {
         return getApiKey(context).isNotBlank()
+    }
+
+    /**
+     * v3.9.0：应用回到前台时，若上次分析未完成，自动从剩余照片继续。
+     * 只续「已经开始过」的分析，不会在首次安装时擅自启动（云端 AI 会消耗流量）。
+     */
+    fun isAutoResumeEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_AUTO_RESUME, true)
+    }
+
+    fun setAutoResumeEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_AUTO_RESUME, enabled).apply()
     }
 }

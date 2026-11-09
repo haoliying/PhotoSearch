@@ -21,6 +21,20 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
+/**
+ * v3.9.0：断点续分析。
+ *
+ * 旧版用「已分析张数」当相册下标来续跑，还要求照片总数完全一致，一旦新增/删除照片、
+ * MediaStore 排序变化、分析完成再点一次，就会 clear() 或从头重跑；加上每 200 张才落盘，
+ * 前台服务被系统限额杀掉时整段进度全部回退 —— 几万张照片几乎永远跑不完。
+ *
+ * 现在：
+ *  - 由 [AnalysisPlanner] 按 photoId 差集算出「本次待分析」列表，已落盘的绝不重跑；
+ *  - 每分析完一张立即 append 一行结果，进程被强杀最多丢当前这一张；
+ *  - 计数标记按间隔刷新，恢复时以行文件里的 id 为唯一权威；
+ *  - 云端 AI 描述缺失的占位结果会在下一次开启 AI 时自动补齐；
+ *  - 中断 / 取消 / 正常停止都在 finally 与 onDestroy 里写入未完成标记。
+ */
 class AnalysisService : Service() {
 
     companion object {
@@ -66,14 +80,18 @@ class AnalysisService : Service() {
     private lateinit var resultStore: AnalysisResultStore
     private var lastEmittedProgress = -1
     private var lastEmitTime = 0L
+    /** 本轮是否已正常跑完；决定 finally / onDestroy 是否写「未完成」标记。 */
+    @Volatile
+    private var completed = false
+    /** VLM 连续失败时本轮降级为本地分析，避免几万张照片各退避几秒。 */
+    @Volatile
+    private var vlmDegraded = false
 
     /**
      * v3.8.0：合并「状态流 + 通知」两次更新并节流。
-     * 旧版每分析 1 张（本地模式 3 张）就 emit 一次 StateFlow，ViewModel 收到后
-     * 会全量 map 一次照片列表并跑一次全库检索 —— 3 万张照片下这是主要假死来源。
+     * 进度语义在 v3.9.0 改为「相册里已完整分析的张数」，而不是本轮处理序号。
      */
     private fun emitProgress(
-        force: Boolean,
         current: Int,
         total: Int,
         isResumed: Boolean,
@@ -82,13 +100,14 @@ class AnalysisService : Service() {
         statusText: String
     ) {
         val now = System.currentTimeMillis()
-        if (!force && current - lastEmittedProgress < PROGRESS_EMIT_STEP && now - lastEmitTime < 400L) return
+        if (current - lastEmittedProgress < PROGRESS_EMIT_STEP && now - lastEmitTime < 400L) return
         lastEmittedProgress = current
         lastEmitTime = now
         updateState(
             isRunning = true,
             progress = current,
             total = total,
+            isComplete = false,
             isResumed = isResumed,
             vlmEnabled = vlmEnabled,
             vlmErrors = vlmErrors
@@ -105,7 +124,7 @@ class AnalysisService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification("正在分析照片…", 0, 0),
+        startForeground(NOTIFICATION_ID, buildNotification("正在准备分析…", 0, 0),
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
             } else 0
@@ -115,6 +134,8 @@ class AnalysisService : Service() {
             runAnalysis()
         }
 
+        // 不用 START_STICKY：后台静默重启前台服务在 Android 12+ 会受限，
+        // 且云端 AI 分析会偷跑流量。改由 App 回到前台时自动续（见 MainActivity）。
         return START_NOT_STICKY
     }
 
@@ -126,167 +147,183 @@ class AnalysisService : Service() {
         if (useVlm) {
             vlmAnalyzer = VisionLanguageAnalyzer(applicationContext)
         }
-
-        val segmentSize = AppConfig.getSegmentSize(applicationContext)
+        // 原「分段大小」现在只用于刷新 meta 计数的间隔，不再决定结果落盘粒度
+        val metaFlushStep = AppConfig.getSegmentSize(applicationContext).coerceIn(10, 200)
 
         try {
-            updateState(isRunning = true, progress = 0, total = 0, vlmEnabled = useVlm)
+            updateState(
+                isRunning = true, progress = 0, total = 0, isComplete = false,
+                isResumed = false, vlmEnabled = useVlm, vlmErrors = 0
+            )
             val photos = repository.loadAllPhotos()
             allPhotos = photos
 
             if (photos.isEmpty()) {
-                updateState(isRunning = false, isComplete = true, vlmEnabled = useVlm)
-                stopSelf()
+                resultStore.markComplete(0, 0)
+                updateState(
+                    isRunning = false, isComplete = true, progress = 0, total = 0,
+                    isResumed = false, vlmEnabled = useVlm, vlmErrors = 0
+                )
+                updateNotification("相册为空，无需分析", 0, 0)
+                completed = true
                 return
             }
 
-            // Check for saved progress to resume
             val saved = resultStore.load()
-            val startIndex: Int
-            val isResumed: Boolean
+            val analyzed: Map<Long, PhotoMetadata> = saved?.metadataMap ?: emptyMap()
 
-            if (saved != null && !saved.isComplete && saved.totalPhotos == photos.size) {
-                analyzedMetadata.putAll(saved.metadataMap)
-                startIndex = saved.analyzedCount
-                isResumed = true
-                updateNotification("恢复分析 ${startIndex} / ${photos.size}", startIndex, photos.size)
-            } else {
-                if (saved != null && saved.totalPhotos != photos.size) {
-                    resultStore.clear()
-                }
-                startIndex = 0
-                isResumed = false
-            }
+            // companion 是进程级静态 Map：Service 在同一进程内重启时先清干净，
+            // 保证内存状态与磁盘进度完全一致，避免把旧结果当成「本轮新分析」。
+            analyzedMetadata.clear()
+            analyzedMetadata.putAll(analyzed)
 
-            updateState(isRunning = true, progress = startIndex, total = photos.size, isResumed = isResumed, vlmEnabled = useVlm)
+            val plan = AnalysisPlanner.plan(photos.map { it.id }, analyzed, useVlm)
 
-            val processedCount = AtomicInteger(startIndex)
-            val vlmErrorCount = AtomicInteger(0)
-
-            var segmentStart = startIndex
-            while (segmentStart < photos.size) {
-                val segmentEnd = minOf(segmentStart + segmentSize, photos.size)
-                val segment = photos.subList(segmentStart, segmentEnd)
-
-                // Process one at a time when VLM is enabled (to avoid API rate limits)
-                // Process in batches when only using on-device analysis
-                if (useVlm) {
-                    for (photo in segment) {
-                        try {
-                            // On-device analysis (fast, offline)
-                            val onDeviceMetadata = onDeviceAnalyzer!!.analyzePhoto(photo.uri, applicationContext)
-
-                            // VLM analysis (slow, requires network, much more accurate)
-                            var description = ""
-                            var vlmKeywords = listOf<String>()
-                            try {
-                                val vlmResult = vlmAnalyzer!!.analyzePhoto(photo.uri)
-                                if (vlmResult.success) {
-                                    description = vlmResult.description
-                                    vlmKeywords = vlmResult.keywords
-                                } else {
-                                    vlmErrorCount.incrementAndGet()
-                                    Log.w(TAG, "VLM分析失败 [${photo.id}]: ${vlmResult.error}")
-                                }
-                            } catch (e: Exception) {
-                                vlmErrorCount.incrementAndGet()
-                                Log.e(TAG, "VLM异常 [${photo.id}]", e)
-                                // Rate limit protection: if too many errors, skip VLM for remaining
-                                if (vlmErrorCount.get() > 10) {
-                                    updateNotification("VLM API 频繁出错，切换到本地分析", processedCount.get(), photos.size)
-                                    delay(5000) // Back off
-                                }
-                            }
-
-                            val metadata = onDeviceMetadata.copy(
-                                photoId = photo.id,
-                                description = description,
-                                vlmKeywords = vlmKeywords
-                            )
-                            analyzedMetadata[photo.id] = metadata
-                        } catch (e: Exception) {
-                            Log.e(TAG, "分析照片失败 [${photo.id}]", e)
-                            // 即使本地分析失败也写入占位结果，保证照片在检索时不会被直接丢弃
-                            analyzedMetadata[photo.id] = PhotoMetadata(
-                                photoId = photo.id, isAnalyzed = true
-                            )
-                        }
-
-                        val current = processedCount.incrementAndGet()
-                        val statusText = if (useVlm) {
-                            "分析中 $current / ${photos.size}" + if (vlmErrorCount.get() > 0) " (VLM错误:${vlmErrorCount.get()})" else ""
-                        } else {
-                            "正在分析照片 $current / ${photos.size}"
-                        }
-                        emitProgress(false, current, photos.size, isResumed, useVlm,
-                            vlmErrorCount.get(), statusText)
-                    }
-                } else {
-                    // On-device only: batch processing
-                    val batchSize = 3
-                    val totalBatches = (segment.size + batchSize - 1) / batchSize
-
-                    for (batchIndex in 0 until totalBatches) {
-                        val batchStart = batchIndex * batchSize
-                        val batchEnd = minOf(batchStart + batchSize, segment.size)
-                        val batch = segment.subList(batchStart, batchEnd)
-
-                        val results = batch.map { photo ->
-                            val metadata = onDeviceAnalyzer!!.analyzePhoto(photo.uri, applicationContext)
-                            photo.id to metadata.copy(photoId = photo.id)
-                        }
-
-                        results.forEach { (id, metadata) ->
-                            analyzedMetadata[id] = metadata
-                        }
-
-                        val current = processedCount.addAndGet(batch.size)
-                        emitProgress(false, current, photos.size, isResumed, useVlm, 0,
-                            "正在分析照片 $current / ${photos.size}")
-                    }
-                }
-
-                // Save progress after each segment
-                resultStore.saveSegment(
-                    totalPhotos = photos.size,
-                    analyzedCount = segmentEnd,
-                    isComplete = segmentEnd >= photos.size,
-                    metadataMap = analyzedMetadata
+            if (plan.complete) {
+                resultStore.markComplete(photos.size, analyzed.size)
+                updateState(
+                    isRunning = false, isComplete = true, progress = photos.size, total = photos.size,
+                    isResumed = false, vlmEnabled = useVlm, vlmErrors = 0
                 )
-
-                segmentStart = segmentEnd
+                updateNotification("分析完成，共 ${photos.size} 张照片", photos.size, photos.size)
+                completed = true
+                return
             }
 
-            updateState(isRunning = false, isComplete = true, progress = photos.size,
-                total = photos.size, isResumed = false, vlmEnabled = useVlm, vlmErrors = vlmErrorCount.get())
+            val isResumed = plan.resumed
+            val byId = HashMap<Long, PhotoItem>(photos.size * 2)
+            photos.forEach { byId[it.id] = it }
+
+            updateState(
+                isRunning = true, progress = plan.doneCount, total = photos.size,
+                isComplete = false, isResumed = isResumed, vlmEnabled = useVlm, vlmErrors = 0
+            )
+            val startText = if (isResumed) {
+                "继续分析：还剩 ${plan.pendingCount} 张（已完成 ${plan.doneCount}）"
+            } else {
+                "开始分析 ${plan.pendingCount} 张照片"
+            }
+            updateNotification(startText, plan.doneCount, photos.size)
+            if (plan.retryVlmCount > 0) {
+                Log.i(TAG, "本次补齐 ${plan.retryVlmCount} 张缺少 AI 描述的照片")
+            }
+
+            var done = plan.doneCount
+            var sinceFlush = 0
+            var degradedNotified = false
+            val vlmErrorCount = AtomicInteger(0)
+            vlmDegraded = false
+
+            for (id in plan.pendingIds) {
+                // 服务被停止时立刻退出；此前每一张都已单独落盘，不会回退
+                currentCoroutineContext().ensureActive()
+                val photo = byId[id] ?: continue
+
+                if (vlmDegraded && !degradedNotified) {
+                    degradedNotified = true
+                    updateNotification("VLM 频繁出错，本轮改用本地分析（下次自动补齐 AI 描述）", done, photos.size)
+                }
+                val metadata = analyzeOne(photo, useVlm, vlmErrorCount)
+                analyzedMetadata[id] = metadata
+                resultStore.appendResult(id, metadata)          // 单张落盘，O(1)
+
+                done++
+                sinceFlush++
+                if (sinceFlush >= metaFlushStep) {
+                    resultStore.markProgress(photos.size, done)
+                    sinceFlush = 0
+                }
+
+                val statusText = if (useVlm) {
+                    "分析中 $done / ${photos.size}" +
+                            if (vlmErrorCount.get() > 0) " (VLM错误:${vlmErrorCount.get()})" else ""
+                } else {
+                    "正在分析照片 $done / ${photos.size}"
+                }
+                emitProgress(done, photos.size, isResumed, useVlm, vlmErrorCount.get(), statusText)
+            }
+
+            resultStore.markComplete(photos.size, done)
+            updateState(
+                isRunning = false, isComplete = true, progress = done, total = photos.size,
+                isResumed = false, vlmEnabled = useVlm, vlmErrors = vlmErrorCount.get()
+            )
             val completeMsg = when {
                 useVlm && vlmErrorCount.get() == 0 ->
-                    "分析完成（含AI描述）${photos.size}/${photos.size}"
+                    "分析完成（含AI描述）${done}/${photos.size}"
                 useVlm ->
-                    "分析完成，但 ${vlmErrorCount.get()} 张缺少AI描述：请检查设置里的模型与 API Key，然后点「重新分析全部」"
+                    "分析完成，但 ${vlmErrorCount.get()} 张缺少AI描述：可检查模型与 API Key 后再次进入应用自动补齐"
                 else ->
                     "分析完成（仅本地标签）：开启 AI 描述可显著提升搜索效果"
             }
-            updateNotification(completeMsg, photos.size, photos.size)
+            updateNotification(completeMsg, done, photos.size)
+            completed = true
 
+        } catch (e: CancellationException) {
+            // 不吞掉取消异常，交给 finally 写未完成标记
+            throw e
         } catch (e: Exception) {
             e.printStackTrace()
-            if (analyzedMetadata.isNotEmpty() && allPhotos.isNotEmpty()) {
-                resultStore.saveSegment(
-                    totalPhotos = allPhotos.size,
-                    analyzedCount = analyzedMetadata.size,
-                    isComplete = false,
-                    metadataMap = analyzedMetadata
-                )
-            }
-            updateState(isRunning = false, isComplete = false, vlmEnabled = useVlm)
+            Log.e(TAG, "分析中断", e)
+            updateState(
+                isRunning = false, isComplete = false,
+                progress = analyzedMetadata.size, total = allPhotos.size,
+                isResumed = false, vlmEnabled = useVlm, vlmErrors = 0
+            )
         } finally {
+            if (!completed && allPhotos.isNotEmpty()) {
+                // 中断 / 异常 / 取消：记录未完成，下次启动按 id 差集自动续
+                resultStore.markProgress(allPhotos.size, analyzedMetadata.size)
+            }
             onDeviceAnalyzer?.close()
             onDeviceAnalyzer = null
             vlmAnalyzer = null
-            delay(2000)
             stopSelf()
         }
+    }
+
+    /** 分析单张：本地标签必写，云端 AI 失败时写占位结果（下次开启 AI 自动补齐）。 */
+    private suspend fun analyzeOne(
+        photo: PhotoItem,
+        useVlm: Boolean,
+        vlmErrorCount: AtomicInteger
+    ): PhotoMetadata {
+        val onDevice = try {
+            onDeviceAnalyzer!!.analyzePhoto(photo.uri, applicationContext)
+        } catch (e: Exception) {
+            Log.e(TAG, "本地分析失败 [${photo.id}]", e)
+            PhotoMetadata(photoId = photo.id, isAnalyzed = true)
+        }
+
+        var description = ""
+        var vlmKeywords = emptyList<String>()
+        if (useVlm && !vlmDegraded) {
+            try {
+                val vlmResult = vlmAnalyzer!!.analyzePhoto(photo.uri)
+                if (vlmResult.success) {
+                    description = vlmResult.description
+                    vlmKeywords = vlmResult.keywords
+                } else {
+                    vlmErrorCount.incrementAndGet()
+                    Log.w(TAG, "VLM分析失败 [${photo.id}]: ${vlmResult.error}")
+                }
+            } catch (e: Exception) {
+                vlmErrorCount.incrementAndGet()
+                Log.e(TAG, "VLM异常 [${photo.id}]", e)
+            }
+            if (vlmErrorCount.get() >= 20) {
+                // 连续失败不再逐张重试：本轮剩余照片只写本地标签，
+                // 这些占位结果会在下次开启 AI 时由 AnalysisPlanner 自动补齐。
+                vlmDegraded = true
+                Log.w(TAG, "VLM 连续失败 20 次，本轮降级为本地分析")
+            }
+        }
+
+        return onDevice.copy(
+            photoId = photo.id,
+            description = description,
+            vlmKeywords = vlmKeywords
+        )
     }
 
     private fun updateState(
@@ -352,6 +389,12 @@ class AnalysisService : Service() {
     }
 
     override fun onDestroy() {
+        // 进程正常结束但本轮未跑完时兜底；强杀场景靠单张 appendResult 保证不丢
+        if (!completed && allPhotos.isNotEmpty()) {
+            try {
+                resultStore.markProgress(allPhotos.size, analyzedMetadata.size)
+            } catch (_: Exception) { }
+        }
         serviceScope.cancel()
         super.onDestroy()
     }

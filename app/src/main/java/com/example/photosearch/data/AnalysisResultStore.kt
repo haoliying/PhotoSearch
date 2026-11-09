@@ -8,11 +8,14 @@ import java.io.File
 /**
  * Persists photo analysis results (PhotoMetadata) to local storage.
  *
- * v3.8.0：改为**增量行式存储**。
- * 旧实现每完成一个 segment 就把全部已分析照片序列化成一个 JSON 重新落盘，
- * 3 万张照片时是 O(N²) 磁盘写入，分析到后半段会明显拖慢整机。
- * 新实现只把本段新增的 photoId 追加成一行（O(新增数)），
- * totalPhotos / analyzedCount / isComplete 单独写一个小 meta 文件。
+ * v3.8.0：改为增量行式存储（JSONL 追加 + 独立 meta），修掉 O(N²) 全量重写。
+ * v3.9.0：**落盘粒度降到单张**。
+ *  - 旧版每完成一个 segment（默认 200 张）才保存一次，云端 AI 单张要几秒，
+ *    一旦前台服务被系统限额杀掉 / OOM / 用户划掉任务，整段 200 张全部回退；
+ *  - 现在每分析完一张立即 append 一行（O(1)），meta 里的计数按间隔刷新，
+ *    恢复时以「行文件里实际存在的 photoId」为唯一权威，不再依赖计数下标；
+ *  - 新增 appendResult / appendResults / markProgress / markComplete 轻量接口，
+ *    批量重分析不再对几万条缓存做全表 filterKeys 扫描。
  * 旧版单文件在首次写入时一次性迁移，读取时自动兼容。
  */
 class AnalysisResultStore(context: Context) {
@@ -22,7 +25,7 @@ class AnalysisResultStore(context: Context) {
     private val lineFile = File(filesDir, LINE_FILE)
     private val metaFile = File(filesDir, META_FILE)
     private val lock = Any()
-    /** 本实例已写入的 id，避免重复追加；跨实例重复行在 load 时后写覆盖即可。 */
+    /** 本实例已写入的 id：仅供 saveSegment 的兼容去重；appendResult 允许覆盖写。 */
     private val writtenIds = HashSet<Long>()
 
     companion object {
@@ -33,6 +36,7 @@ class AnalysisResultStore(context: Context) {
         private const val KEY_TOTAL_PHOTOS = "totalPhotos"
         private const val KEY_ANALYZED_COUNT = "analyzedCount"
         private const val KEY_IS_COMPLETE = "isComplete"
+        private const val KEY_LAST_UPDATE = "lastUpdate"
         private const val KEY_RESULTS = "results"
         private const val KEY_PHOTO_ID = "photoId"
         private const val KEY_METADATA = "metadata"
@@ -41,11 +45,66 @@ class AnalysisResultStore(context: Context) {
 
     data class StoredAnalysis(
         val totalPhotos: Int,
+        /** 行文件里真实存在的结果数（不是 meta 里可能过期的计数）。 */
         val analyzedCount: Int,
         val isComplete: Boolean,
-        val metadataMap: Map<Long, PhotoMetadata>
-    )
+        val metadataMap: Map<Long, PhotoMetadata>,
+        /** 最后一次写入时间，用于界面显示「上次分析」。 */
+        val lastUpdate: Long = 0L
+    ) {
+        val analyzedIds: Set<Long> get() = metadataMap.keys
+    }
 
+    /** 单条结果立即落盘。被系统强杀时最多丢当前这一张。 */
+    fun appendResult(photoId: Long, metadata: PhotoMetadata) {
+        synchronized(lock) {
+            try {
+                ensureMigrated()
+                appendLinesLocked(listOf(photoId to metadata))
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    /** 批量追加：只写指定的 id，避免几万张照片时全表扫描。 */
+    fun appendResults(ids: Collection<Long>, metadataMap: Map<Long, PhotoMetadata>) {
+        if (ids.isEmpty()) return
+        synchronized(lock) {
+            try {
+                ensureMigrated()
+                val entries = ArrayList<Pair<Long, PhotoMetadata>>(ids.size)
+                ids.forEach { id -> metadataMap[id]?.let { entries += id to it } }
+                appendLinesLocked(entries)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    /** 只刷新进度标记，不写结果行。中断兜底用。 */
+    fun markProgress(totalPhotos: Int, analyzedCount: Int) =
+        writeMetaSafe(totalPhotos, analyzedCount, false)
+
+    /** 标记本轮全部完成。 */
+    fun markComplete(totalPhotos: Int, analyzedCount: Int) =
+        writeMetaSafe(totalPhotos, analyzedCount, true)
+
+    private fun writeMetaSafe(totalPhotos: Int, analyzedCount: Int, isComplete: Boolean) {
+        synchronized(lock) {
+            try {
+                ensureMigrated()
+                writeMeta(totalPhotos, analyzedCount, isComplete)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    /**
+     * 兼容旧调用点：全表去重追加 + 写 meta。
+     * 新代码请用 appendResult / appendResults + markProgress / markComplete。
+     */
     fun saveSegment(
         totalPhotos: Int,
         analyzedCount: Int,
@@ -56,18 +115,8 @@ class AnalysisResultStore(context: Context) {
             try {
                 ensureMigrated()
                 val fresh = metadataMap.filterKeys { it !in writtenIds }
-                if (fresh.isNotEmpty()) {
-                    val sb = StringBuilder()
-                    fresh.forEach { (photoId, metadata) ->
-                        sb.append(JSONObject().apply {
-                            put(KEY_PHOTO_ID, photoId)
-                            put(KEY_METADATA, serializeMetadata(metadata))
-                        }.toString()).append('\n')
-                    }
-                    lineFile.appendText(sb.toString())
-                    writtenIds.addAll(fresh.keys)
-                }
-                writeMeta(totalPhotos, analyzedCount, isComplete)
+                appendLinesLocked(fresh.map { it.key to it.value })
+                writeMeta(totalPhotos, writtenIds.size.coerceAtLeast(analyzedCount), isComplete)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -94,10 +143,11 @@ class AnalysisResultStore(context: Context) {
                     writtenIds.clear()
                     writtenIds.addAll(map.keys)
                     return StoredAnalysis(
-                        meta.getInt(KEY_TOTAL_PHOTOS),
-                        meta.getInt(KEY_ANALYZED_COUNT),
-                        meta.getBoolean(KEY_IS_COMPLETE),
-                        map
+                        meta.optInt(KEY_TOTAL_PHOTOS, 0),
+                        map.size,
+                        meta.optBoolean(KEY_IS_COMPLETE, false),
+                        map,
+                        meta.optLong(KEY_LAST_UPDATE, 0L)
                     )
                 }
                 if (!legacyFile.exists()) return null
@@ -114,9 +164,10 @@ class AnalysisResultStore(context: Context) {
                 writtenIds.addAll(map.keys)
                 StoredAnalysis(
                     json.getInt(KEY_TOTAL_PHOTOS),
-                    json.getInt(KEY_ANALYZED_COUNT),
+                    map.size,
                     json.getBoolean(KEY_IS_COMPLETE),
-                    map
+                    map,
+                    json.optLong(KEY_LAST_UPDATE, 0L)
                 )
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -132,7 +183,8 @@ class AnalysisResultStore(context: Context) {
         }
     }
 
-    fun hasProgress(): Boolean = load()?.let { !it.isComplete && it.analyzedCount > 0 } == true
+    /** 是否存在「已开始但没跑完」的进度。v3.9.0 起仅用于提示，不再作为续跑门槛。 */
+    fun hasProgress(): Boolean = load()?.let { it.analyzedCount > 0 } == true
 
     // --- 内部：迁移与 meta ---
 
@@ -176,10 +228,24 @@ class AnalysisResultStore(context: Context) {
             put(KEY_TOTAL_PHOTOS, totalPhotos)
             put(KEY_ANALYZED_COUNT, analyzedCount)
             put(KEY_IS_COMPLETE, isComplete)
+            put(KEY_LAST_UPDATE, System.currentTimeMillis())
         }
         val tmp = File(filesDir, "$META_FILE.tmp")
         tmp.writeText(json.toString())
         tmp.renameTo(metaFile)
+    }
+
+    private fun appendLinesLocked(entries: Iterable<Pair<Long, PhotoMetadata>>) {
+        val sb = StringBuilder()
+        for ((photoId, metadata) in entries) {
+            sb.append(JSONObject().apply {
+                put(KEY_PHOTO_ID, photoId)
+                put(KEY_METADATA, serializeMetadata(metadata))
+            }.toString()).append('\n')
+        }
+        if (sb.isEmpty()) return
+        lineFile.appendText(sb.toString())
+        entries.forEach { writtenIds.add(it.first) }
     }
 
     // --- Serialization ---

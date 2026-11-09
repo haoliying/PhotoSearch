@@ -10,6 +10,7 @@ import com.example.photosearch.data.*
 import com.example.photosearch.ml.EnhancedImageAnalyzer
 import com.example.photosearch.ml.VisionLanguageAnalyzer
 import com.example.photosearch.search.*
+import com.example.photosearch.service.AnalysisPlanner
 import com.example.photosearch.service.AnalysisService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -69,7 +70,11 @@ data class PhotoSearchState(
     // v3.8.0
     val isSearching: Boolean = false,
     /** exifMap 是同一个 ConcurrentHashMap 引用，靠版本号触发 UI 刷新，避免全量复制。 */
-    val exifVersion: Int = 0
+    val exifVersion: Int = 0,
+    // v3.9.0 断点续分析：按 photoId 统计，不再依赖「照片总数相等」或列表下标
+    val doneCount: Int = 0,
+    val pendingCount: Int = 0,
+    val autoResumeEnabled: Boolean = true
 )
 
 /** computeFilters 的产物，主线程一次性写入 StateFlow。 */
@@ -106,6 +111,9 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile
     private var filterGeneration = 0L
     private var lastSyncedProgress = -1
+    /** onResume 可能早于 loadPhotos 完成，记下请求等相册加载后再判断。 */
+    @Volatile
+    private var resumeRequested = false
 
     init {
         loadPhotos()
@@ -144,11 +152,11 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
-                val hasAnalyzed = AnalysisService.analysisState.value.isComplete ||
-                        saved?.isComplete == true ||
-                        metadataCache.isNotEmpty()
-                val canResume = saved != null && !saved.isComplete &&
-                        saved.analyzedCount > 0 && saved.totalPhotos == photos.size
+                // v3.9.0：与 Service 共用同一个计划器，按 photoId 差集算进度。
+                // 照片增删、排序变化、isComplete 标记都不再影响「还剩几张」的判断。
+                val plan = withContext(Dispatchers.Default) { computePlan(photos) }
+                val hasAnalyzed = plan.doneCount > 0 || saved?.isComplete == true ||
+                        AnalysisService.analysisState.value.isComplete
 
                 docCache.clear()
                 // 先把相册显示出来，EXIF 在后台异步提取，避免首屏白屏
@@ -157,12 +165,17 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                     filteredPhotos = merged,
                     isLoading = false,
                     hasAnalyzed = hasAnalyzed,
-                    canResume = canResume,
-                    savedProgress = saved?.analyzedCount ?: 0,
-                    savedTotal = saved?.totalPhotos ?: 0
+                    canResume = plan.resumed,
+                    savedProgress = plan.doneCount,
+                    savedTotal = plan.totalCount,
+                    doneCount = plan.doneCount,
+                    pendingCount = plan.pendingCount,
+                    autoResumeEnabled = AppConfig.isAutoResumeEnabled(getApplication())
                 )
                 scheduleFilters(0)
                 extractExif(photos)
+                // onResume 早于本次加载完成时，加载完再补一次自动续判断
+                if (resumeRequested) performAutoResume()
             } catch (e: Exception) {
                 _state.value = _state.value.copy(
                     isLoading = false,
@@ -374,6 +387,13 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** v3.9.0：用纯逻辑计划器算「已完成 / 待分析」，UI 与 Service 口径完全一致。 */
+    private fun computePlan(photos: List<PhotoItem>): AnalysisPlanner.Plan {
+        val app = getApplication<Application>()
+        val useVlm = AppConfig.isVlmEnabled(app) && AppConfig.hasApiKey(app)
+        return AnalysisPlanner.plan(photos.map { it.id }, metadataCache, useVlm)
+    }
+
     // ------------------------------------------------------------------
     // 对 UI 暴露的筛选 API
     // ------------------------------------------------------------------
@@ -436,15 +456,20 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
     private fun observeServiceState() {
         viewModelScope.launch {
             AnalysisService.analysisState.collect { serviceProgress ->
+                // v3.9.0：Service 的 progress 就是「相册里已完整分析的张数」
+                val remaining = (serviceProgress.total - serviceProgress.progress).coerceAtLeast(0)
                 _state.value = _state.value.copy(
                     isAnalyzing = serviceProgress.isRunning,
                     analysisProgress = serviceProgress.progress,
                     analysisTotal = serviceProgress.total,
+                    doneCount = serviceProgress.progress,
+                    pendingCount = remaining,
                     hasAnalyzed = serviceProgress.isComplete ||
+                            serviceProgress.progress > 0 ||
                             _state.value.hasAnalyzed ||
                             AnalysisService.analyzedMetadata.isNotEmpty(),
                     canResume = if (serviceProgress.isRunning || serviceProgress.isComplete) false
-                    else _state.value.canResume
+                    else remaining > 0 && serviceProgress.progress > 0
                 )
 
                 // v3.8.0：分析期间绝不跑全量 map / 全库检索，只更新进度条；
@@ -472,11 +497,15 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                     } else photo
                 }
             }
+            val plan = withContext(Dispatchers.Default) { computePlan(snapshot) }
             _state.value = _state.value.copy(
                 allPhotos = merged,
-                canResume = false,
-                savedProgress = 0,
-                savedTotal = 0
+                canResume = plan.resumed,
+                savedProgress = plan.doneCount,
+                savedTotal = plan.totalCount,
+                doneCount = plan.doneCount,
+                pendingCount = plan.pendingCount,
+                hasAnalyzed = plan.doneCount > 0 || _state.value.hasAnalyzed
             )
             docCache.clear()
             scheduleFilters(0)
@@ -495,6 +524,41 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         _state.value = _state.value.copy(isAnalyzing = true)
     }
 
+    /** 「继续分析」与「开始分析」走同一入口：Service 自己按 photoId 差集决定从哪开始。 */
+    fun resumeAnalysis() = startAnalysis()
+
+    /**
+     * v3.9.0：应用回到前台时自动续跑。
+     * 只续「已经开始过、但还剩照片没分析」的任务（plan.resumed），
+     * 首次安装或全部完成时都不会擅自启动，避免云端 AI 偷跑流量。
+     * 可在设置里关闭「自动继续未完成的照片分析」。
+     */
+    fun autoResumeIfNeeded() {
+        resumeRequested = true
+        val app = getApplication<Application>()
+        _state.value = _state.value.copy(
+            autoResumeEnabled = AppConfig.isAutoResumeEnabled(app)
+        )
+        if (_state.value.allPhotos.isNotEmpty()) performAutoResume()
+    }
+
+    private fun performAutoResume() {
+        val app = getApplication<Application>()
+        if (!AppConfig.isAutoResumeEnabled(app)) return
+        val st = _state.value
+        if (st.isAnalyzing || AnalysisService.isRunning() || st.allPhotos.isEmpty()) return
+        val plan = computePlan(st.allPhotos)
+        _state.value = st.copy(
+            doneCount = plan.doneCount,
+            pendingCount = plan.pendingCount,
+            savedProgress = plan.doneCount,
+            savedTotal = plan.totalCount,
+            hasAnalyzed = plan.doneCount > 0 || st.hasAnalyzed,
+            canResume = plan.resumed
+        )
+        if (plan.resumed) startAnalysis()
+    }
+
     fun restartAnalysis() {
         if (_state.value.isAnalyzing || AnalysisService.isRunning()) return
         viewModelScope.launch {
@@ -510,7 +574,9 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                 hasAnalyzed = false,
                 canResume = false,
                 savedProgress = 0,
-                savedTotal = 0
+                savedTotal = 0,
+                doneCount = 0,
+                pendingCount = stripped.size
             )
             scheduleFilters(0)
             startAnalysis()
@@ -558,13 +624,13 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                 AnalysisService.analyzedMetadata[photo.id] = metadata
                 docCache.invalidate(listOf(photo.id))
 
+                // v3.9.0：只追加这一张，不对几万条缓存做全表扫描
                 withContext(Dispatchers.IO) {
-                    resultStore.saveSegment(
-                        totalPhotos = _state.value.allPhotos.size,
-                        analyzedCount = metadataCache.size,
-                        isComplete = _state.value.allPhotos.all { metadataCache.containsKey(it.id) },
-                        metadataMap = metadataCache
-                    )
+                    resultStore.appendResults(listOf(photo.id), metadataCache)
+                    val all = _state.value.allPhotos
+                    val done = all.count { metadataCache.containsKey(it.id) }
+                    if (done == all.size) resultStore.markComplete(all.size, done)
+                    else resultStore.markProgress(all.size, done)
                 }
 
                 val updatedPhoto = photo.copy(
@@ -708,13 +774,13 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
+                // v3.9.0：只追加本批变化的 id，避免全表扫描
                 withContext(Dispatchers.IO) {
-                    resultStore.saveSegment(
-                        totalPhotos = _state.value.allPhotos.size,
-                        analyzedCount = metadataCache.size,
-                        isComplete = _state.value.allPhotos.all { metadataCache.containsKey(it.id) },
-                        metadataMap = metadataCache
-                    )
+                    resultStore.appendResults(updatedById.keys, metadataCache)
+                    val all = _state.value.allPhotos
+                    val done = all.count { metadataCache.containsKey(it.id) }
+                    if (done == all.size) resultStore.markComplete(all.size, done)
+                    else resultStore.markProgress(all.size, done)
                 }
                 if (updatedById.isNotEmpty()) {
                     docCache.invalidate(updatedById.keys)

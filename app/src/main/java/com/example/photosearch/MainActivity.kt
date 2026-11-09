@@ -20,6 +20,8 @@ import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
 import com.example.photosearch.ui.SwipeBackContainer
+import com.example.photosearch.ui.screens.AboutScreen
+import com.example.photosearch.ui.screens.HelpScreen
 import com.example.photosearch.ui.screens.HomeScreen
 import com.example.photosearch.ui.screens.PhotoDetailScreen
 import com.example.photosearch.ui.screens.SettingsScreen
@@ -70,14 +72,29 @@ class MainActivity : ComponentActivity() {
                 ) {
                     val state by viewModel.state.collectAsState()
                     var showSettings by remember { mutableStateOf(false) }
+                    // v3.9.0：版本说明 / 操作手册
+                    var showAbout by remember { mutableStateOf(false) }
+                    var showHelp by remember { mutableStateOf(false) }
 
                     when {
+                        showAbout -> {
+                            SwipeBackContainer(onBack = { showAbout = false }) {
+                                AboutScreen(onBack = { showAbout = false })
+                            }
+                        }
+                        showHelp -> {
+                            SwipeBackContainer(onBack = { showHelp = false }) {
+                                HelpScreen(onBack = { showHelp = false })
+                            }
+                        }
                         showSettings -> {
                             // v3.7.0：右滑 / 系统返回键都回到相册主页
                             SwipeBackContainer(onBack = { showSettings = false }) {
                                 SettingsScreen(
                                     context = this@MainActivity,
-                                    onBack = { showSettings = false }
+                                    onBack = { showSettings = false },
+                                    onOpenAbout = { showSettings = false; showAbout = true },
+                                    onOpenHelp = { showSettings = false; showHelp = true }
                                 )
                             }
                         }
@@ -107,15 +124,19 @@ class MainActivity : ComponentActivity() {
                                 onSearch = { viewModel.search(it) },
                                 onPhotoClick = { viewModel.selectPhoto(it) },
                                 onStartAnalysis = { viewModel.startAnalysis() },
-                                onResumeAnalysis = { viewModel.startAnalysis() },
+                                onResumeAnalysis = { viewModel.resumeAnalysis() },
                                 onRestartAnalysis = { viewModel.restartAnalysis() },
                                 canResume = state.canResume,
-                                savedProgress = state.savedProgress,
-                                savedTotal = state.savedTotal,
+                                savedProgress = state.doneCount,
+                                savedTotal = state.allPhotos.size,
+                                doneCount = state.doneCount,
+                                pendingCount = state.pendingCount,
                                 searchResultCount = state.searchResultCount,
                                 suggestions = viewModel.getSuggestions(),
                                 ruleDescription = viewModel.getRuleDescription(),
                                 onSettingsClick = { showSettings = true },
+                                onOpenAbout = { showAbout = true },
+                                onOpenHelp = { showHelp = true },
                                 error = state.error,
                                 onReloadPhotos = { viewModel.reloadPhotos() },
                                 onClearSearch = { viewModel.search("") },
@@ -160,6 +181,8 @@ class MainActivity : ComponentActivity() {
         // 用户可能在系统设置里改过照片权限，或首次授权后返回前台；列表为空时重扫一次
         if (ContextCompat.checkSelfPermission(this, photoPermission()) == PackageManager.PERMISSION_GRANTED) {
             viewModel.reloadIfEmpty()
+            // v3.9.0：上次分析中断后，回到前台自动从剩余照片继续（可在设置里关闭）
+            viewModel.autoResumeIfNeeded()
         }
     }
 

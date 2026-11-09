@@ -70,10 +70,15 @@ fun HomeScreen(
     canResume: Boolean,
     savedProgress: Int,
     savedTotal: Int,
+    // v3.9.0 断点续分析
+    doneCount: Int = 0,
+    pendingCount: Int = 0,
     searchResultCount: Int,
     suggestions: List<String>,
     ruleDescription: String?,
     onSettingsClick: () -> Unit = {},
+    onOpenAbout: () -> Unit = {},
+    onOpenHelp: () -> Unit = {},
     error: String? = null,
     onReloadPhotos: () -> Unit = {},
     onClearSearch: () -> Unit = {},
@@ -201,6 +206,17 @@ fun HomeScreen(
                                     leadingIcon = { Icon(Icons.Default.PhotoLibrary, null) },
                                     onClick = { showOverflow = false; onReloadPhotos() }
                                 )
+                                Divider()
+                                DropdownMenuItem(
+                                    text = { Text("操作手册") },
+                                    leadingIcon = { Icon(Icons.Default.List, null) },
+                                    onClick = { showOverflow = false; onOpenHelp() }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("版本说明") },
+                                    leadingIcon = { Icon(Icons.Default.Info, null) },
+                                    onClick = { showOverflow = false; onOpenAbout() }
+                                )
                             }
                         }
                     }
@@ -299,12 +315,15 @@ fun HomeScreen(
                     canResume = canResume,
                     savedProgress = savedProgress,
                     savedTotal = savedTotal,
+                    doneCount = doneCount,
+                    pendingCount = pendingCount,
                     isExtractingExif = isExtractingExif,
                     exifProgress = exifProgress,
                     exifTotal = exifTotal,
                     onStartAnalysis = onStartAnalysis,
                     onResumeAnalysis = onResumeAnalysis,
-                    onRestartAnalysis = onRestartAnalysis
+                    onRestartAnalysis = onRestartAnalysis,
+                    onOpenHelp = onOpenHelp
                 )
             }
 
@@ -729,21 +748,39 @@ private fun AnalysisStatusBar(
     canResume: Boolean,
     savedProgress: Int,
     savedTotal: Int,
+    doneCount: Int,
+    pendingCount: Int,
     isExtractingExif: Boolean,
     exifProgress: Int,
     exifTotal: Int,
     onStartAnalysis: () -> Unit,
     onResumeAnalysis: () -> Unit,
-    onRestartAnalysis: () -> Unit
+    onRestartAnalysis: () -> Unit,
+    onOpenHelp: () -> Unit
 ) {
     when {
-        isAnalyzing -> ThinProgress("正在分析照片内容…", progress, total)
+        // v3.9.0：进度口径是「相册里已完整分析的张数」，不是本轮处理序号
+        isAnalyzing -> {
+            val remain = (total - progress).coerceAtLeast(0)
+            ThinProgress(
+                if (remain > 0) "正在分析：已完成 $progress / $total，还剩 $remain 张（可随时退出，下次自动继续）"
+                else "正在收尾…",
+                progress, total
+            )
+        }
         canResume -> Surface(color = Surface) {
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically) {
-                Text("上次分析中断（$savedProgress / $savedTotal）", fontSize = 11.sp,
-                    color = OnSurface.copy(alpha = 0.7f), modifier = Modifier.weight(1f))
-                TextButton(onClick = onRestartAnalysis) { Text("重来", fontSize = 11.sp) }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("已分析 $doneCount 张，还有 $pendingCount 张待分析", fontSize = 11.sp,
+                        color = OnSurface.copy(alpha = 0.8f))
+                    Text("下次进入应用会自动继续，不会从头开始", fontSize = 10.sp,
+                        color = OnSurface.copy(alpha = 0.55f))
+                }
+                TextButton(onClick = onRestartAnalysis,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)) {
+                    Text("全部重来", fontSize = 11.sp)
+                }
                 Button(onClick = onResumeAnalysis,
                     colors = ButtonDefaults.buttonColors(containerColor = Primary),
                     shape = RoundedCornerShape(8.dp),
@@ -756,6 +793,10 @@ private fun AnalysisStatusBar(
                 verticalAlignment = Alignment.CenterVertically) {
                 Text("尚未分析照片内容，无法按内容搜索", fontSize = 11.sp,
                     color = OnSurface.copy(alpha = 0.7f), modifier = Modifier.weight(1f))
+                TextButton(onClick = onOpenHelp,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)) {
+                    Text("怎么用", fontSize = 11.sp)
+                }
                 Button(onClick = onStartAnalysis,
                     colors = ButtonDefaults.buttonColors(containerColor = Primary),
                     shape = RoundedCornerShape(8.dp),
@@ -770,7 +811,7 @@ private fun AnalysisStatusBar(
                     color = OnSurface.copy(alpha = 0.55f))
             }
         }
-        // 分析完成：不占任何空间，把屏幕留给照片
+        // 分析完成且无待分析照片：不占任何空间，把屏幕留给照片
         else -> Unit
     }
 }

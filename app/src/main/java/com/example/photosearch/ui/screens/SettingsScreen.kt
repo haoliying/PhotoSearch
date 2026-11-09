@@ -22,16 +22,20 @@ import com.example.photosearch.ui.theme.*
 @Composable
 fun SettingsScreen(
     context: android.content.Context,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onOpenAbout: () -> Unit = {},
+    onOpenHelp: () -> Unit = {}
 ) {
     var apiKey by remember { mutableStateOf(AppConfig.getApiKey(context)) }
     var apiProvider by remember { mutableStateOf(AppConfig.getApiProvider(context)) }
     var vlmEnabled by remember { mutableStateOf(AppConfig.isVlmEnabled(context)) }
     var segmentSize by remember { mutableStateOf(AppConfig.getSegmentSize(context).toString()) }
+    var autoResume by remember { mutableStateOf(AppConfig.isAutoResumeEnabled(context)) }
     var saved by remember { mutableStateOf(false) }
 
     val providers = VisionLanguageAnalyzer.PROVIDERS
     val selectedProvider = providers.find { it.id == apiProvider } ?: providers[0]
+    val versionText = remember { appVersion(context) }
 
     Scaffold(
         topBar = {
@@ -178,12 +182,12 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "分析分段大小",
+                        text = "进度标记刷新间隔",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Medium
                     )
                     Text(
-                        text = "每分析多少张照片保存一次进度（防止崩溃丢失）",
+                        text = "v3.9.0 起每张照片分析完立即单独保存，退出或中断都不会丢进度。此项只控制进度数字多久写一次，不影响安全性。",
                         style = MaterialTheme.typography.bodySmall,
                         color = OnSurface.copy(alpha = 0.6f)
                     )
@@ -199,12 +203,52 @@ fun SettingsScreen(
                 }
             }
 
+            // v3.9.0 断点续分析设置
+            Text(
+                text = "分析进度",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = OnSurface
+            )
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Surface)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "自动继续未完成的照片分析",
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = "回到应用时从上次剩余的照片接着分析，不会从头开始；新增照片也只分析新增的。关闭后可在首页点「继续」。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = OnSurface.copy(alpha = 0.6f)
+                            )
+                        }
+                        Switch(checked = autoResume, onCheckedChange = {
+                            autoResume = it
+                            saved = false
+                        })
+                    }
+                }
+            }
+
             // Save button
             Button(
                 onClick = {
                     AppConfig.setVlmEnabled(context, vlmEnabled)
                     AppConfig.setApiProvider(context, apiProvider)
                     AppConfig.setApiKey(context, apiKey)
+                    AppConfig.setAutoResumeEnabled(context, autoResume)
                     val size = segmentSize.toIntOrNull()
                     if (size != null && size > 0) {
                         AppConfig.setSegmentSize(context, size)
@@ -232,7 +276,7 @@ fun SettingsScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "智能相册搜索 v3.1",
+                        text = "智能相册搜索 $versionText",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Spacer(modifier = Modifier.height(4.dp))
@@ -248,10 +292,26 @@ fun SettingsScreen(
                         color = Secondary,
                         fontWeight = FontWeight.Medium
                     )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = onOpenHelp) { Text("操作手册") }
+                        TextButton(onClick = onOpenAbout) { Text("版本说明") }
+                    }
                 }
             }
 
             Spacer(modifier = Modifier.height(16.dp))
         }
+    }
+}
+
+/** 从 PackageManager 读取真实版本号，避免设置页硬编码版本随迭代漂移。 */
+@Suppress("DEPRECATION")
+private fun appVersion(context: android.content.Context): String {
+    return try {
+        val info = context.packageManager.getPackageInfo(context.packageName, 0)
+        "v${info.versionName} (${info.versionCode})"
+    } catch (e: Exception) {
+        "v3.9.0"
     }
 }
