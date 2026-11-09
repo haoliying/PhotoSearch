@@ -44,6 +44,11 @@ object ConceptRegistry {
         "bicycle", "bike", "cycling", "garage", "parking", "train station", "toy car", "model car"
     ).sortedByDescending { it.length }
 
+    /** v3.8.0：一次扫描替换全部易混淆词，替代 24 次 String.replace。 */
+    private val CAR_CONFUSABLE_REGEX = Regex(
+        CAR_CONFUSABLES.joinToString("|") { Regex.escape(it.lowercase()) }
+    )
+
     private val NEGATION_PREFIXES = listOf("没有", "无", "不含", "看不到", "并非", "不是", "未出现")
     private val NEGATION_SUFFIXES = listOf("也没有", "都没有", "均没有", "并不存在")
     private val UNCERTAIN_PREFIXES = listOf(
@@ -113,6 +118,29 @@ object ConceptRegistry {
 
     private val ASCII_WORD = Regex("^[a-z0-9 ]+$")
 
+    /** 同权重文本拼接分隔符：控制字符不会出现在查询词里，避免跨条目误命中。 */
+    private const val INDEX_SEP = "\u0001"
+
+    /**
+     * v3.8.0：等价于旧的 Regex("(?<![a-z])word(?![a-z])")，但不编译正则。
+     * 旧实现每次匹配都 new 一个 Regex 对象，在几万张照片 × 几十个词的规模下
+     * 会产生数百万次正则编译，是搜索假死的主要常数级瓶颈。
+     * 注意保持与旧正则一致的边界定义：只把 [a-z] 视作单词字符。
+     */
+    fun containsAsciiWord(text: String, word: String): Boolean {
+        if (word.isEmpty()) return false
+        var from = 0
+        while (true) {
+            val i = text.indexOf(word, from)
+            if (i < 0) return false
+            val beforeOk = i == 0 || text[i - 1] !in 'a'..'z'
+            val after = i + word.length
+            val afterOk = after >= text.length || text[after] !in 'a'..'z'
+            if (beforeOk && afterOk) return true
+            from = i + 1
+        }
+    }
+
     /**
      * 需要从全文索引中剔除的「噪声组合词」。
      * 与 CAR_CONFUSABLES 的区别：这里不放「自行车 / 摩托车」——它们本身是用户
@@ -150,14 +178,32 @@ object ConceptRegistry {
         "给", "张", "些", "个", "一下", "里", "中"
     ).sortedByDescending { it.length }
 
+    /**
+     * v3.8.0：normalize 是纯函数，且标签 / 关键词在几万张照片间高度重复，
+     * 加一层有上限的 LRU 缓存，避免每次 fromMetadata 都重扫 30×10 的词表。
+     */
+    private val NORMALIZE_CACHE_MAX = 4096
+    private val normalizeCache = java.util.Collections.synchronizedMap(
+        object : LinkedHashMap<String, Set<Concept>>(512, 0.75f, true) {
+            override fun removeEldestEntry(
+                eldest: MutableMap.MutableEntry<String, Set<Concept>>?
+            ): Boolean = size > NORMALIZE_CACHE_MAX
+        }
+    )
+
     /** 把一段自由文本映射为规范概念集合。 */
     fun normalize(text: String): Set<Concept> {
         if (text.isBlank()) return emptySet()
+        val key = text.lowercase()
+        normalizeCache[key]?.let { return it }
+        val result = normalizeUncached(key)
+        normalizeCache[key] = result
+        return result
+    }
 
-        val lower = text.lowercase()
+    private fun normalizeUncached(lower: String): Set<Concept> {
         // 仅 CAR 使用屏蔽后的文本，其余概念仍看原文（修复自行车/摩托车无法检索）
-        var carText = lower
-        for (w in CAR_CONFUSABLES) carText = carText.replace(w.lowercase(), " ")
+        val carText = CAR_CONFUSABLE_REGEX.replace(lower, " ")
 
         val found = mutableSetOf<Concept>()
         for ((concept, surfaces) in SURFACES) {
@@ -165,7 +211,8 @@ object ConceptRegistry {
             for (s in surfaces.sortedByDescending { it.length }) {
                 val sl = s.lowercase()
                 val hit = if (ASCII_WORD.matches(sl)) {
-                    Regex("(?<![a-z])${Regex.escape(sl)}(?![a-z])").containsMatchIn(target)
+                    // v3.8.0：无正则的 ASCII 词边界匹配，语义与旧版完全一致
+                    containsAsciiWord(target, sl)
                 } else {
                     target.contains(sl)
                 }
@@ -255,6 +302,7 @@ object ConceptRegistry {
      */
     private val SEGMENT_SPLIT = Regex("""[\s,，、;；!！?？:：.。()（）\[\]【】]+""")
     private val WHITESPACE = Regex("\\s+")
+    private val DESC_SPLIT = Regex("[，。、；！？,.\\s:：;；\\n\"]+")
 
     fun tokenizeQuery(text: String): List<String> {
         val t = text.lowercase().trim()
@@ -262,12 +310,12 @@ object ConceptRegistry {
         val out = mutableListOf<String>()
         for (seg in t.split(SEGMENT_SPLIT)) {
             if (ASCII_WORD.matches(seg)) {
-                out += seg.split(Regex("\\s+")).filter { it.length >= 3 }
+                out += seg.split(WHITESPACE).filter { it.length >= 3 }
                 continue
             }
             var s = seg
             for (w in STOPWORDS) s = s.replace(w, " ")
-            for (piece in s.split(Regex("\\s+"))) {
+            for (piece in s.split(WHITESPACE)) {
                 val p = piece.trim()
                 if (p.length < 2) continue
                 out += p
@@ -285,40 +333,104 @@ object ConceptRegistry {
     // 全文检索索引
     // ---------------------------------------------------------------------
 
-    /** 剔除描述套话、否定句、不确定表述，避免它们变成可检索词或造成误排除。 */
-    private fun scrub(text: String): String {
-        var t = text.lowercase()
-        for (w in INDEX_NOISE) t = t.replace(w, " ")
-        for (w in BOILERPLATE) t = t.replace(w, " ")
-        t = NEGATION_REGEX.replace(t, " ")
-        t = UNCERTAIN_REGEX.replace(t, " ")
-        return t.trim()
+    /**
+     * v3.8.0：把 46 次 String.replace 合成一次正则扫描。
+     * 旧实现每张照片约 15 次 add × 46 次 replace ≈ 700 次字符串重建，
+     * 3 万张照片就是 2000 万次，是首次检索耗时的主要来源。
+     * 分支顺序按「否定/不确定句式 > 长词 > 短词」，与旧版降序逐个替换等价。
+     */
+    private val SCRUB_REGEX: Regex = run {
+        val parts = mutableListOf<String>()
+        parts += "(?:没有|并无|不含|看不到|并非|不是|未出现)\\s*[\\u4e00-\\u9fa5a-zA-Z]{1,12}"
+        parts += "(?:看起来像|疑似|可能是|似乎是|仿佛|有点像|像是|好像是)\\s*[\\u4e00-\\u9fa5]{1,12}"
+        (INDEX_NOISE + BOILERPLATE)
+            .sortedByDescending { it.length }
+            .forEach { parts += Regex.escape(it.lowercase()) }
+        Regex(parts.joinToString("|"))
     }
 
-    class SearchIndex(private val entries: List<Pair<String, Float>>) {
-        /**
-         * 返回查询词元在这张照片上的最高证据权重，0 表示未命中。
-         * 中文要求词元长度 >= 2，英文要求 >= 3 且词边界匹配。
-         */
+    /** 剔除描述套话、否定句、不确定表述，避免它们变成可检索词或造成误排除。 */
+    private fun scrub(text: String): String {
+        val t = text.lowercase()
+        if (!SCRUB_REGEX.containsMatchIn(t)) return t.trim()
+        return SCRUB_REGEX.replace(t, " ").trim()
+    }
+
+    /**
+     * v3.8.0 全文索引：按权重分桶的紧凑结构。
+     *
+     * 旧版为每张照片保存 50~100 条 (文本, 权重)，每次查询为每个词元编译一次
+     * 正则并遍历全部条目；几万张照片时内存与时间都不可控。
+     * 新版把「同权重的所有文本」用控制字符拼成一个字符串，桶按权重降序排列：
+     *  - 语义等价：旧版返回所有命中条目中的最大权重，降序桶的第一个命中即该值；
+     *  - 内存降到原来的 1/5 左右，查询不再编译正则，且命中即返回。
+     */
+    class SearchIndex(private val buckets: List<Pair<Float, String>>) {
+
+        /** 返回查询词元在这张照片上的最高证据权重，0 表示未命中。 */
         fun score(term: String): Float {
             val q = term.lowercase().trim()
             if (q.isEmpty()) return 0f
             val ascii = ASCII_WORD.matches(q)
             if (ascii) {
                 if (q.length < 3) return 0f
-                val re = Regex("(?<![a-z])${Regex.escape(q)}(?![a-z])")
-                var best = 0f
-                for ((phrase, w) in entries) {
-                    if (w > best && re.containsMatchIn(phrase)) best = w
+                for ((w, text) in buckets) {
+                    if (containsAsciiWord(text, q)) return w
                 }
-                return best
+                return 0f
             }
             if (q.length < 2) return 0f
-            var best = 0f
-            for ((phrase, w) in entries) {
-                if (w > best && (phrase == q || phrase.contains(q))) best = w
+            for ((w, text) in buckets) {
+                if (text.contains(q)) return w
             }
-            return best
+            return 0f
+        }
+
+        /** 供离线评测与调试观察索引规模。 */
+        val bucketCount: Int get() = buckets.size
+    }
+
+    /** 一张照片的检索预处理结果：与查询无关，可以跨多次搜索复用。 */
+    data class PreparedDoc(
+        val evidence: Map<Concept, Float>,
+        val index: SearchIndex
+    )
+
+    fun prepare(m: PhotoMetadata, exif: PhotoExif? = null): PreparedDoc =
+        PreparedDoc(fromMetadata(m), buildSearchIndex(m, exif))
+
+    /**
+     * v3.8.0 文档缓存：LRU，按 photoId 缓存 PreparedDoc。
+     * 几万张照片时为避免内存膨胀，默认只保留最近 6000 张；未命中的照片现算，
+     * 由于已去掉正则编译，单次全量检索在后台线程也是秒级，不会阻塞输入。
+     * 元数据/EXIF 变化时由 ViewModel 调用 invalidate / clear。
+     */
+    class SearchDocCache(private val maxSize: Int = DEFAULT_MAX_DOCS) {
+        private val map = object : LinkedHashMap<Long, PreparedDoc>(
+            minOf(maxSize, 1024), 0.75f, true
+        ) {
+            override fun removeEldestEntry(
+                eldest: MutableMap.MutableEntry<Long, PreparedDoc>?
+            ): Boolean = size > maxSize
+        }
+
+        @Synchronized
+        fun get(photoId: Long, m: PhotoMetadata, exif: PhotoExif?): PreparedDoc =
+            map[photoId] ?: prepare(m, exif).also { map[photoId] = it }
+
+        @Synchronized
+        fun invalidate(ids: Collection<Long>) {
+            ids.forEach { map.remove(it) }
+        }
+
+        @Synchronized
+        fun clear() = map.clear()
+
+        @Synchronized
+        fun size(): Int = map.size
+
+        companion object {
+            const val DEFAULT_MAX_DOCS = 6000
         }
     }
 
@@ -328,15 +440,18 @@ object ConceptRegistry {
      * 这样即使自然语言里没被解析成结构化筛选，输入「北京」「2023」也能命中。
      */
     fun buildSearchIndex(m: PhotoMetadata, exif: PhotoExif? = null): SearchIndex {
-        val entries = mutableListOf<Pair<String, Float>>()
+        // v3.8.0：同权重文本合并，桶按权重降序，命中即返回最大权重
+        val buckets = mutableMapOf<Float, StringBuilder>()
         fun add(text: String, weight: Float) {
             val s = scrub(text)
-            if (s.length >= 2) entries += s to weight
+            if (s.length >= 2) {
+                buckets.getOrPut(weight) { StringBuilder() }.append(s).append(INDEX_SEP)
+            }
         }
 
         m.vlmKeywords.forEach { add(it, 1.0f) }
         add(m.description, 0.80f)
-        m.description.split(Regex("[，。、；！？,.\\s:：;；\\n\"]+"))
+        m.description.split(DESC_SPLIT)
             .filter { it.length >= 2 }
             .forEach { add(it, 0.85f) }
 
@@ -386,7 +501,7 @@ object ConceptRegistry {
             val loc = exif.searchableLocation()
             if (loc.isNotBlank()) {
                 add(loc, 0.85f)
-                loc.split(Regex("""\s+""")).filter { it.length >= 2 }.forEach { add(it, 0.85f) }
+                loc.split(WHITESPACE).filter { it.length >= 2 }.forEach { add(it, 0.85f) }
             }
             if (exif.hasTime) {
                 val cal = java.util.Calendar.getInstance().apply { timeInMillis = exif.dateTaken }
@@ -398,7 +513,10 @@ object ConceptRegistry {
             // v3.7.0：相机 / 镜头 / 曝光 / 画幅 / 格式 / 季节 / 时段等中文标签
             exif.searchableExifTags().forEach { add(it, 0.75f) }
         }
-        return SearchIndex(entries)
+        val ordered = buckets.entries
+            .sortedByDescending { it.key }
+            .map { it.key to it.value.toString() }
+        return SearchIndex(ordered)
     }
 
     fun descriptionOf(concepts: Collection<Concept>): String = when {

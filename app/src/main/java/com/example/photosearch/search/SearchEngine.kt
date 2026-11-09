@@ -17,6 +17,10 @@ import com.example.photosearch.data.PhotoMetadata
  */
 object SearchEngine {
 
+    /** 后台检索被 newer 查询取消时抛出，ViewModel 捕获后丢弃本次结果。 */
+    class SearchCancelledException : RuntimeException()
+
+    private val STRICT_ASCII = Regex("^[a-z0-9 -]+$")
     private const val MIN_EVIDENCE = 0.5f       // 概念证据强度下限
     private const val TEXT_MIN_EVIDENCE = 0.55f // 全文通道证据强度下限
     private const val RANK_THRESHOLD = 0.45f    // RANK 模式平均分下限
@@ -38,33 +42,42 @@ object SearchEngine {
         val source: String
     )
 
+    /**
+     * v3.8.0：
+     * - cache：跨查询复用每张照片的预处理结果（概念证据 + 全文索引），不再每次重建；
+     * - isActive：每 256 张检查一次，输入变化时可立刻取消旧查询，避免任务堆积。
+     * 两个参数都有默认值，离线评测脚本无需改动。
+     */
     fun search(
         intent: SearchIntent,
         photos: List<PhotoItem>,
         metadataMap: Map<Long, PhotoMetadata>,
-        exifMap: Map<Long, PhotoExif> = emptyMap()
+        exifMap: Map<Long, PhotoExif> = emptyMap(),
+        cache: ConceptRegistry.SearchDocCache? = null,
+        isActive: () -> Boolean = { true }
     ): List<SearchResult> {
         if (intent.conditions.isEmpty() && !intent.hasFilters) return emptyList()
 
-        return photos.mapNotNull { photo ->
+        return photos.mapIndexedNotNull { index, photo ->
+            if (index % 256 == 0 && !isActive()) throw SearchCancelledException()
             val exif = exifMap[photo.id]
 
             // ---- 硬过滤 1：时间区间 ----
             val time = intent.timeRange
             if (time != null) {
                 val t = effectiveTime(photo, exif)
-                if (t <= 0L || !time.contains(t)) return@mapNotNull null
+                if (t <= 0L || !time.contains(t)) return@mapIndexedNotNull null
             }
 
             // ---- 硬过滤 2：地点（模糊 / 半径） ----
             val loc = intent.locationQuery
             if (loc != null) {
-                if (exif == null || !LocationMatcher.matches(exif, loc)) return@mapNotNull null
+                if (exif == null || !LocationMatcher.matches(exif, loc)) return@mapIndexedNotNull null
             }
 
             // ---- 只有时间/地点筛选，没有内容词 ----
             if (intent.filtersOnly) {
-                return@mapNotNull SearchResult(
+                return@mapIndexedNotNull SearchResult(
                     photo = photo,
                     score = FILTER_ONLY_SCORE,
                     matchedConditions = filterLabels(intent),
@@ -78,11 +91,14 @@ object SearchEngine {
                 labels = photo.labels,
                 isAnalyzed = false
             )
-            val evidence = ConceptRegistry.fromMetadata(metadata)
-            val index = ConceptRegistry.buildSearchIndex(metadata, exif)
+            // v3.8.0：优先复用缓存，未命中才现算；缓存未启用时行为与旧版一致
+            val doc = cache?.get(photo.id, metadata, exif)
+                ?: ConceptRegistry.prepare(metadata, exif)
+            val evidence = doc.evidence
+            val docIndex = doc.index
 
             val evals = intent.conditions.map { cond ->
-                val (hit, score, source) = evaluateCondition(cond, metadata, evidence, index)
+                val (hit, score, source) = evaluateCondition(cond, metadata, evidence, docIndex)
                 ConditionEval(
                     condition = cond,
                     hit = hit,
@@ -113,7 +129,7 @@ object SearchEngine {
                 }
             }
 
-            if (!pass || avgScore <= 0f) return@mapNotNull null
+            if (!pass || avgScore <= 0f) return@mapIndexedNotNull null
 
             SearchResult(
                 photo = photo,
@@ -181,13 +197,13 @@ object SearchEngine {
         val kw = keyword.lowercase().trim()
         if (kw.isEmpty()) return false
 
-        val isAscii = Regex("^[a-z0-9 -]+$").matches(kw)
-        val wordPattern = if (isAscii) Regex("(?<![a-z])${Regex.escape(kw)}(?![a-z])") else null
+        val isAscii = STRICT_ASCII.matches(kw)
 
         fun hit(text: String): Boolean {
             val t = text.lowercase()
-            return if (wordPattern != null) {
-                wordPattern.containsMatchIn(t)
+            return if (isAscii) {
+                // v3.8.0：无正则词边界，等价于旧的 (?<![a-z])kw(?![a-z])
+                ConceptRegistry.containsAsciiWord(t, kw)
             } else {
                 t == kw || (kw.length >= 2 && t.contains(kw))
             }

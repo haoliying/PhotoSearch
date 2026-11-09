@@ -143,7 +143,10 @@ class MainActivity : ComponentActivity() {
                                 onLocationQueryChange = { viewModel.setLocationQuery(it) },
                                 onSelectPlace = { viewModel.selectPlace(it) },
                                 onClearFilters = { viewModel.clearFilters() },
-                                exifMap = state.exifMap
+                                exifMap = state.exifMap,
+                                // v3.8.0
+                                isSearching = state.isSearching,
+                                exifVersion = state.exifVersion
                             )
                         }
                     }

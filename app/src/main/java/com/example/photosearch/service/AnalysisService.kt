@@ -18,6 +18,7 @@ import com.example.photosearch.ml.VisionLanguageAnalyzer
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 class AnalysisService : Service() {
@@ -31,7 +32,11 @@ class AnalysisService : Service() {
         private val _analysisState = MutableStateFlow(AnalysisProgress())
         val analysisState = _analysisState.asStateFlow()
 
-        val analyzedMetadata = mutableMapOf<Long, PhotoMetadata>()
+        /** v3.8.0：Service 写、ViewModel 读，必须用并发 Map。 */
+        val analyzedMetadata = ConcurrentHashMap<Long, PhotoMetadata>()
+
+        /** 进度发射节流：每 20 张或 400ms，避免几万张照片时刷爆 UI。 */
+        private const val PROGRESS_EMIT_STEP = 20
 
         var allPhotos: List<PhotoItem> = emptyList()
             private set
@@ -59,6 +64,37 @@ class AnalysisService : Service() {
     private var onDeviceAnalyzer: EnhancedImageAnalyzer? = null
     private var vlmAnalyzer: VisionLanguageAnalyzer? = null
     private lateinit var resultStore: AnalysisResultStore
+    private var lastEmittedProgress = -1
+    private var lastEmitTime = 0L
+
+    /**
+     * v3.8.0：合并「状态流 + 通知」两次更新并节流。
+     * 旧版每分析 1 张（本地模式 3 张）就 emit 一次 StateFlow，ViewModel 收到后
+     * 会全量 map 一次照片列表并跑一次全库检索 —— 3 万张照片下这是主要假死来源。
+     */
+    private fun emitProgress(
+        force: Boolean,
+        current: Int,
+        total: Int,
+        isResumed: Boolean,
+        vlmEnabled: Boolean,
+        vlmErrors: Int,
+        statusText: String
+    ) {
+        val now = System.currentTimeMillis()
+        if (!force && current - lastEmittedProgress < PROGRESS_EMIT_STEP && now - lastEmitTime < 400L) return
+        lastEmittedProgress = current
+        lastEmitTime = now
+        updateState(
+            isRunning = true,
+            progress = current,
+            total = total,
+            isResumed = isResumed,
+            vlmEnabled = vlmEnabled,
+            vlmErrors = vlmErrors
+        )
+        updateNotification(statusText, current, total)
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -177,21 +213,13 @@ class AnalysisService : Service() {
                         }
 
                         val current = processedCount.incrementAndGet()
-                        updateState(
-                            isRunning = true,
-                            progress = current,
-                            total = photos.size,
-                            isResumed = isResumed,
-                            vlmEnabled = useVlm,
-                            vlmErrors = vlmErrorCount.get()
-                        )
-
                         val statusText = if (useVlm) {
                             "分析中 $current / ${photos.size}" + if (vlmErrorCount.get() > 0) " (VLM错误:${vlmErrorCount.get()})" else ""
                         } else {
                             "正在分析照片 $current / ${photos.size}"
                         }
-                        updateNotification(statusText, current, photos.size)
+                        emitProgress(false, current, photos.size, isResumed, useVlm,
+                            vlmErrorCount.get(), statusText)
                     }
                 } else {
                     // On-device only: batch processing
@@ -213,14 +241,8 @@ class AnalysisService : Service() {
                         }
 
                         val current = processedCount.addAndGet(batch.size)
-                        updateState(
-                            isRunning = true,
-                            progress = current,
-                            total = photos.size,
-                            isResumed = isResumed,
-                            vlmEnabled = useVlm
-                        )
-                        updateNotification("正在分析照片 $current / ${photos.size}", current, photos.size)
+                        emitProgress(false, current, photos.size, isResumed, useVlm, 0,
+                            "正在分析照片 $current / ${photos.size}")
                     }
                 }
 
@@ -229,13 +251,14 @@ class AnalysisService : Service() {
                     totalPhotos = photos.size,
                     analyzedCount = segmentEnd,
                     isComplete = segmentEnd >= photos.size,
-                    metadataMap = analyzedMetadata.toMap()
+                    metadataMap = analyzedMetadata
                 )
 
                 segmentStart = segmentEnd
             }
 
-            updateState(isRunning = false, isComplete = true, isResumed = false, vlmEnabled = useVlm, vlmErrors = vlmErrorCount.get())
+            updateState(isRunning = false, isComplete = true, progress = photos.size,
+                total = photos.size, isResumed = false, vlmEnabled = useVlm, vlmErrors = vlmErrorCount.get())
             val completeMsg = when {
                 useVlm && vlmErrorCount.get() == 0 ->
                     "分析完成（含AI描述）${photos.size}/${photos.size}"
@@ -253,7 +276,7 @@ class AnalysisService : Service() {
                     totalPhotos = allPhotos.size,
                     analyzedCount = analyzedMetadata.size,
                     isComplete = false,
-                    metadataMap = analyzedMetadata.toMap()
+                    metadataMap = analyzedMetadata
                 )
             }
             updateState(isRunning = false, isComplete = false, vlmEnabled = useVlm)

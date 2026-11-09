@@ -22,11 +22,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.example.photosearch.data.PhotoExif
 import com.example.photosearch.data.PhotoItem
 import com.example.photosearch.data.chineseDisplayTags
@@ -101,7 +103,10 @@ fun HomeScreen(
     onSelectPlace: (PlaceSuggestion) -> Unit = {},
     onClearFilters: () -> Unit = {},
     // v3.7.0：列表视图展示 EXIF 信息
-    exifMap: Map<Long, PhotoExif> = emptyMap()
+    exifMap: Map<Long, PhotoExif> = emptyMap(),
+    // v3.8.0：后台检索状态 / EXIF 缓存版本（触发列表刷新，避免全量复制）
+    isSearching: Boolean = false,
+    exifVersion: Int = 0
 ) {
     var showSearch by rememberSaveable { mutableStateOf(false) }
     var showFilters by rememberSaveable { mutableStateOf(false) }
@@ -229,6 +234,14 @@ fun HomeScreen(
             if (batchReanalyzing) {
                 ThinProgress("正在重新分析照片…", batchProgress, batchTotal)
             }
+            // v3.8.0：检索在后台线程跑，用一条细进度条反馈，输入与滚动不受影响
+            if (isSearching) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Primary,
+                    trackColor = ProgressTrack
+                )
+            }
 
             // ---------- 生效条件摘要：只占一行 ----------
             if (!selectionMode && hasConditions) {
@@ -239,7 +252,8 @@ fun HomeScreen(
                     resultCount = searchResultCount,
                     onExpandSearch = { showSearch = true },
                     onExpandFilters = { showFilters = true },
-                    onClearAll = { onClearSearch(); onClearFilters(); showSearch = false; showFilters = false }
+                    onClearAll = { onClearSearch(); onClearFilters(); showSearch = false; showFilters = false },
+                    isSearching = isSearching
                 )
             }
 
@@ -309,16 +323,18 @@ fun HomeScreen(
                         error ?: "没有读取到相册照片。请在系统设置 → 权限中允许「照片和视频」（Android 14 请选择「始终允许所有照片」），再点下方按钮重试",
                         "重新加载照片", onReloadPhotos
                     )
-                    else -> PhotoCollection(
-                        photos = photos,
-                        listMode = listMode,
-                        exifMap = exifMap,
-                        selectionMode = selectionMode,
-                        selectedIds = selectedIds,
-                        onPhotoClick = onPhotoClick,
-                        onPhotoLongClick = { onEnterSelection(); onToggleSelection(it.id) },
-                        onPhotoSelect = onToggleSelection
-                    )
+                    else -> key(exifVersion) {
+                        PhotoCollection(
+                            photos = photos,
+                            listMode = listMode,
+                            exifMap = exifMap,
+                            selectionMode = selectionMode,
+                            selectedIds = selectedIds,
+                            onPhotoClick = onPhotoClick,
+                            onPhotoLongClick = { onEnterSelection(); onToggleSelection(it.id) },
+                            onPhotoSelect = onToggleSelection
+                        )
+                    }
                 }
             }
         }
@@ -337,7 +353,8 @@ private fun ActiveConditionBar(
     resultCount: Int,
     onExpandSearch: () -> Unit,
     onExpandFilters: () -> Unit,
-    onClearAll: () -> Unit
+    onClearAll: () -> Unit,
+    isSearching: Boolean = false
 ) {
     Surface(color = Surface, shadowElevation = 1.dp) {
         Row(
@@ -366,7 +383,10 @@ private fun ActiveConditionBar(
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
-            Text("$resultCount 张", fontSize = 11.sp, color = OnSurface.copy(alpha = 0.6f))
+            Text(
+                if (isSearching) "搜索中…" else "$resultCount 张",
+                fontSize = 11.sp, color = OnSurface.copy(alpha = 0.6f)
+            )
             TextButton(onClick = { if (query.isNotBlank()) onExpandSearch() else onExpandFilters() }) {
                 Text("调整", fontSize = 12.sp)
             }
@@ -406,6 +426,14 @@ private fun SearchPanel(
     ruleDescription: String?,
     onClose: () -> Unit
 ) {
+    // v3.8.0：输入框文本由 Compose 本地持有，按键立即回显，
+    // 不经过 ViewModel StateFlow 往返，也就不会被后台检索或全屏重组阻塞。
+    var text by rememberSaveable { mutableStateOf(query) }
+    // 外部清除搜索（摘要栏 / 清空筛选）时同步本地文本
+    LaunchedEffect(query) {
+        if (query.isBlank() && text.isNotBlank()) text = ""
+    }
+
     PanelCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("搜索照片内容", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium,
@@ -415,12 +443,12 @@ private fun SearchPanel(
             }
         }
         OutlinedTextField(
-            value = query,
-            onValueChange = onQueryChange,
+            value = text,
+            onValueChange = { text = it; onQueryChange(it) },
             placeholder = { Text("输入内容、时间或地点，如：2023年 北京 汽车", fontSize = 13.sp) },
             leadingIcon = { Icon(Icons.Default.Search, null, modifier = Modifier.size(20.dp)) },
             trailingIcon = {
-                if (query.isNotBlank()) IconButton(onClick = { onQueryChange("") }) {
+                if (text.isNotBlank()) IconButton(onClick = { text = ""; onQueryChange("") }) {
                     Icon(Icons.Default.Clear, "清空", modifier = Modifier.size(18.dp))
                 }
             },
@@ -437,7 +465,7 @@ private fun SearchPanel(
             modifier = Modifier.padding(top = 8.dp, start = 2.dp)
         )
 
-        if (ruleDescription != null && query.isNotBlank()) {
+        if (ruleDescription != null && text.isNotBlank()) {
             Text("匹配规则：$ruleDescription", fontSize = 11.sp, color = OnSurface.copy(alpha = 0.65f),
                 modifier = Modifier.padding(top = 6.dp, start = 2.dp))
         }
@@ -447,7 +475,7 @@ private fun SearchPanel(
         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             items(suggestions) { s ->
                 SuggestionChip(
-                    onClick = { onQueryChange(s) },
+                    onClick = { text = s; onQueryChange(s) },
                     label = { Text(s, fontSize = 12.sp) },
                     shape = CircleShape,
                     colors = SuggestionChipDefaults.suggestionChipColors(
@@ -815,6 +843,11 @@ private fun PhotoListItem(
     onLongClick: () -> Unit
 ) {
     val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
+    // v3.8.0：显式指定采样尺寸，避免几万张照片滚动时解码原图造成内存抖动
+    val context = LocalContext.current
+    val imageRequest = remember(photo.uri) {
+        ImageRequest.Builder(context).data(photo.uri).size(176).crossfade(false).build()
+    }
     val fallbackTime = if (photo.dateTaken > 0L && photo.dateTaken < 100_000_000_000L)
         photo.dateTaken * 1000L else photo.dateTaken
     val timeText = when {
@@ -845,7 +878,7 @@ private fun PhotoListItem(
         Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.Top) {
             Box {
                 AsyncImage(
-                    model = photo.uri,
+                    model = imageRequest,
                     contentDescription = photo.displayName,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.size(88.dp).clip(RoundedCornerShape(8.dp))
@@ -915,8 +948,12 @@ private fun PhotoThumbnail(
         )
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
+            val context = LocalContext.current
+            val imageRequest = remember(photo.uri) {
+                ImageRequest.Builder(context).data(photo.uri).size(256).crossfade(false).build()
+            }
             AsyncImage(
-                model = photo.uri,
+                model = imageRequest,
                 contentDescription = photo.displayName,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()

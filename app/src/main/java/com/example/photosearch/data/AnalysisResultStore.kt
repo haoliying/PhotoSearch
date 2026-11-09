@@ -7,15 +7,28 @@ import java.io.File
 
 /**
  * Persists photo analysis results (PhotoMetadata) to local storage.
- * Saves incrementally after each segment to prevent data loss on crash/exit.
+ *
+ * v3.8.0：改为**增量行式存储**。
+ * 旧实现每完成一个 segment 就把全部已分析照片序列化成一个 JSON 重新落盘，
+ * 3 万张照片时是 O(N²) 磁盘写入，分析到后半段会明显拖慢整机。
+ * 新实现只把本段新增的 photoId 追加成一行（O(新增数)），
+ * totalPhotos / analyzedCount / isComplete 单独写一个小 meta 文件。
+ * 旧版单文件在首次写入时一次性迁移，读取时自动兼容。
  */
 class AnalysisResultStore(context: Context) {
 
-    private val storeFile = File(context.filesDir, FILE_NAME)
+    private val filesDir = context.filesDir
+    private val legacyFile = File(filesDir, LEGACY_FILE)
+    private val lineFile = File(filesDir, LINE_FILE)
+    private val metaFile = File(filesDir, META_FILE)
     private val lock = Any()
+    /** 本实例已写入的 id，避免重复追加；跨实例重复行在 load 时后写覆盖即可。 */
+    private val writtenIds = HashSet<Long>()
 
     companion object {
-        private const val FILE_NAME = "analysis_results.json"
+        private const val LEGACY_FILE = "analysis_results.json"
+        private const val LINE_FILE = "analysis_results_v3.jsonl"
+        private const val META_FILE = "analysis_meta_v3.json"
         private const val KEY_VERSION = "version"
         private const val KEY_TOTAL_PHOTOS = "totalPhotos"
         private const val KEY_ANALYZED_COUNT = "analyzedCount"
@@ -41,26 +54,20 @@ class AnalysisResultStore(context: Context) {
     ) {
         synchronized(lock) {
             try {
-                val json = JSONObject().apply {
-                    put(KEY_VERSION, CURRENT_VERSION)
-                    put(KEY_TOTAL_PHOTOS, totalPhotos)
-                    put(KEY_ANALYZED_COUNT, analyzedCount)
-                    put(KEY_IS_COMPLETE, isComplete)
-
-                    val resultsArray = JSONArray()
-                    metadataMap.forEach { (photoId, metadata) ->
-                        resultsArray.put(JSONObject().apply {
+                ensureMigrated()
+                val fresh = metadataMap.filterKeys { it !in writtenIds }
+                if (fresh.isNotEmpty()) {
+                    val sb = StringBuilder()
+                    fresh.forEach { (photoId, metadata) ->
+                        sb.append(JSONObject().apply {
                             put(KEY_PHOTO_ID, photoId)
                             put(KEY_METADATA, serializeMetadata(metadata))
-                        })
+                        }.toString()).append('\n')
                     }
-                    put(KEY_RESULTS, resultsArray)
+                    lineFile.appendText(sb.toString())
+                    writtenIds.addAll(fresh.keys)
                 }
-
-                // Write atomically: write to temp file then rename
-                val tempFile = File(storeFile.parent, "${FILE_NAME}.tmp")
-                tempFile.writeText(json.toString())
-                tempFile.renameTo(storeFile)
+                writeMeta(totalPhotos, analyzedCount, isComplete)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -70,26 +77,47 @@ class AnalysisResultStore(context: Context) {
     fun load(): StoredAnalysis? {
         synchronized(lock) {
             return try {
-                if (!storeFile.exists()) return null
-
-                val json = JSONObject(storeFile.readText())
-                val version = json.optInt(KEY_VERSION, 0)
-                if (version != CURRENT_VERSION) return null
-
-                val totalPhotos = json.getInt(KEY_TOTAL_PHOTOS)
-                val analyzedCount = json.getInt(KEY_ANALYZED_COUNT)
-                val isComplete = json.getBoolean(KEY_IS_COMPLETE)
-
-                val metadataMap = mutableMapOf<Long, PhotoMetadata>()
-                val resultsArray = json.getJSONArray(KEY_RESULTS)
-                for (i in 0 until resultsArray.length()) {
-                    val entry = resultsArray.getJSONObject(i)
-                    val photoId = entry.getLong(KEY_PHOTO_ID)
-                    val metadataJson = entry.getJSONObject(KEY_METADATA)
-                    metadataMap[photoId] = deserializeMetadata(metadataJson)
+                if (metaFile.exists() && lineFile.exists()) {
+                    val meta = JSONObject(metaFile.readText())
+                    if (meta.optInt(KEY_VERSION, 0) != CURRENT_VERSION) return null
+                    val map = mutableMapOf<Long, PhotoMetadata>()
+                    lineFile.forEachLine { line ->
+                        if (line.isBlank()) return@forEachLine
+                        try {
+                            val o = JSONObject(line)
+                            val id = o.getLong(KEY_PHOTO_ID)
+                            map[id] = deserializeMetadata(o.getJSONObject(KEY_METADATA))
+                        } catch (_: Exception) {
+                            // 崩溃可能留下半行，跳过
+                        }
+                    }
+                    writtenIds.clear()
+                    writtenIds.addAll(map.keys)
+                    return StoredAnalysis(
+                        meta.getInt(KEY_TOTAL_PHOTOS),
+                        meta.getInt(KEY_ANALYZED_COUNT),
+                        meta.getBoolean(KEY_IS_COMPLETE),
+                        map
+                    )
                 }
-
-                StoredAnalysis(totalPhotos, analyzedCount, isComplete, metadataMap)
+                if (!legacyFile.exists()) return null
+                val json = JSONObject(legacyFile.readText())
+                if (json.optInt(KEY_VERSION, 0) != CURRENT_VERSION) return null
+                val map = mutableMapOf<Long, PhotoMetadata>()
+                val arr = json.getJSONArray(KEY_RESULTS)
+                for (i in 0 until arr.length()) {
+                    val entry = arr.getJSONObject(i)
+                    val photoId = entry.getLong(KEY_PHOTO_ID)
+                    map[photoId] = deserializeMetadata(entry.getJSONObject(KEY_METADATA))
+                }
+                writtenIds.clear()
+                writtenIds.addAll(map.keys)
+                StoredAnalysis(
+                    json.getInt(KEY_TOTAL_PHOTOS),
+                    json.getInt(KEY_ANALYZED_COUNT),
+                    json.getBoolean(KEY_IS_COMPLETE),
+                    map
+                )
             } catch (e: Exception) {
                 e.printStackTrace()
                 null
@@ -99,14 +127,59 @@ class AnalysisResultStore(context: Context) {
 
     fun clear() {
         synchronized(lock) {
-            if (storeFile.exists()) {
-                storeFile.delete()
-            }
+            writtenIds.clear()
+            listOf(lineFile, metaFile, legacyFile).forEach { if (it.exists()) it.delete() }
         }
     }
 
-    fun hasProgress(): Boolean {
-        return storeFile.exists() && load()?.let { !it.isComplete && it.analyzedCount > 0 } == true
+    fun hasProgress(): Boolean = load()?.let { !it.isComplete && it.analyzedCount > 0 } == true
+
+    // --- 内部：迁移与 meta ---
+
+    private fun ensureMigrated() {
+        if (lineFile.exists()) return
+        val sb = StringBuilder()
+        readLegacy()?.forEach { (id, m) ->
+            sb.append(JSONObject().apply {
+                put(KEY_PHOTO_ID, id)
+                put(KEY_METADATA, serializeMetadata(m))
+            }.toString()).append('\n')
+            writtenIds.add(id)
+        }
+        val tmp = File(filesDir, "$LINE_FILE.tmp")
+        tmp.writeText(sb.toString())
+        tmp.renameTo(lineFile)
+        writeMeta(0, writtenIds.size, false)
+    }
+
+    private fun readLegacy(): Map<Long, PhotoMetadata>? {
+        if (!legacyFile.exists()) return null
+        return try {
+            val json = JSONObject(legacyFile.readText())
+            if (json.optInt(KEY_VERSION, 0) != CURRENT_VERSION) return null
+            val arr = json.optJSONArray(KEY_RESULTS) ?: return null
+            val map = mutableMapOf<Long, PhotoMetadata>()
+            for (i in 0 until arr.length()) {
+                val entry = arr.getJSONObject(i)
+                val id = entry.getLong(KEY_PHOTO_ID)
+                map[id] = deserializeMetadata(entry.getJSONObject(KEY_METADATA))
+            }
+            map
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun writeMeta(totalPhotos: Int, analyzedCount: Int, isComplete: Boolean) {
+        val json = JSONObject().apply {
+            put(KEY_VERSION, CURRENT_VERSION)
+            put(KEY_TOTAL_PHOTOS, totalPhotos)
+            put(KEY_ANALYZED_COUNT, analyzedCount)
+            put(KEY_IS_COMPLETE, isComplete)
+        }
+        val tmp = File(filesDir, "$META_FILE.tmp")
+        tmp.writeText(json.toString())
+        tmp.renameTo(metaFile)
     }
 
     // --- Serialization ---
@@ -122,12 +195,10 @@ class AnalysisResultStore(context: Context) {
             put("isAnalyzed", m.isAnalyzed)
             put("description", m.description)
 
-            // VLM keywords
             put("vlmKeywords", JSONArray().apply {
                 m.vlmKeywords.forEach { put(it) }
             })
 
-            // Labels
             put("labels", JSONArray().apply {
                 m.labels.forEach { l ->
                     put(JSONObject().apply {
@@ -137,7 +208,6 @@ class AnalysisResultStore(context: Context) {
                 }
             })
 
-            // Detected objects
             put("objects", JSONArray().apply {
                 m.detectedObjects.forEach { o ->
                     put(JSONObject().apply {
@@ -155,7 +225,6 @@ class AnalysisResultStore(context: Context) {
                 }
             })
 
-            // Faces
             put("faces", JSONArray().apply {
                 m.faces.forEach { f ->
                     put(JSONObject().apply {
@@ -167,7 +236,6 @@ class AnalysisResultStore(context: Context) {
                 }
             })
 
-            // Dominant colors
             put("colors", JSONArray().apply {
                 m.dominantColors.forEach { put(it) }
             })
