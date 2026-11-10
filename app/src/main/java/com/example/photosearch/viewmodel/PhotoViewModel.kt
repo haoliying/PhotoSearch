@@ -1,17 +1,17 @@
 package com.example.photosearch.viewmodel
 
 import android.app.Application
-import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.photosearch.data.*
 import com.example.photosearch.ml.EnhancedImageAnalyzer
 import com.example.photosearch.ml.VisionLanguageAnalyzer
 import com.example.photosearch.search.*
+import com.example.photosearch.service.AnalysisEvents
 import com.example.photosearch.service.AnalysisPlanner
 import com.example.photosearch.service.AnalysisService
+import com.example.photosearch.service.IncrementBuffer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -74,7 +74,14 @@ data class PhotoSearchState(
     // v3.9.0 断点续分析：按 photoId 统计，不再依赖「照片总数相等」或列表下标
     val doneCount: Int = 0,
     val pendingCount: Int = 0,
-    val autoResumeEnabled: Boolean = true
+    val autoResumeEnabled: Boolean = true,
+    // v3.10.0 后台常驻守护 + 相册变化自动分析
+    val backgroundWatchEnabled: Boolean = true,
+    val backgroundWatchActive: Boolean = false,
+    /** 本次守护期间自动分析完成的张数。 */
+    val autoAnalyzedCount: Int = 0,
+    /** 相册变化后正在增量刷新列表，避免重复触发。 */
+    val isAlbumRefreshing: Boolean = false
 )
 
 /** computeFilters 的产物，主线程一次性写入 StateFlow。 */
@@ -87,12 +94,18 @@ private data class FilterOutcome(
     val noLoc: Int
 )
 
+/** v3.10.0：相册变化增量刷新的计算结果（O(N) 计算放在 Dispatchers.Default）。 */
+private data class AlbumRefresh(
+    val merged: List<PhotoItem>,
+    val removedIds: List<Long>,
+    val added: List<PhotoItem>
+)
+
 class PhotoViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val SEARCH_DEBOUNCE_MS = 280L
         private const val EXIF_BATCH = 200
-        private const val SYNC_PROGRESS_STEP = 100
     }
 
     private val repository = PhotoRepository(application)
@@ -110,14 +123,11 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
     private var filterJob: Job? = null
     @Volatile
     private var filterGeneration = 0L
-    private var lastSyncedProgress = -1
-    /** onResume 可能早于 loadPhotos 完成，记下请求等相册加载后再判断。 */
-    @Volatile
-    private var resumeRequested = false
 
     init {
         loadPhotos()
         observeServiceState()
+        observeAnalysisEvents()
     }
 
     /**
@@ -170,12 +180,11 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                     savedTotal = plan.totalCount,
                     doneCount = plan.doneCount,
                     pendingCount = plan.pendingCount,
-                    autoResumeEnabled = AppConfig.isAutoResumeEnabled(getApplication())
+                    autoResumeEnabled = AppConfig.isAutoResumeEnabled(getApplication()),
+                    backgroundWatchEnabled = AppConfig.isBackgroundWatchEnabled(getApplication())
                 )
                 scheduleFilters(0)
                 extractExif(photos)
-                // onResume 早于本次加载完成时，加载完再补一次自动续判断
-                if (resumeRequested) performAutoResume()
             } catch (e: Exception) {
                 _state.value = _state.value.copy(
                     isLoading = false,
@@ -453,117 +462,238 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
     // 分析服务状态
     // ------------------------------------------------------------------
 
+    /**
+     * v3.10.0：只把服务进度映射到 UI，**不再触发全量合并**。
+     * 旧版在服务完成/停止时调 syncServiceResults() → 全量 map + docCache.clear()
+     * + scheduleFilters(0) 全库检索；后台守护不断有小批次完成时会反复清空几万张
+     * 索引、卡住前端搜索。现在结果一律由 [observeAnalysisEvents] 增量吸收。
+     */
     private fun observeServiceState() {
         viewModelScope.launch {
-            AnalysisService.analysisState.collect { serviceProgress ->
-                // v3.9.0：Service 的 progress 就是「相册里已完整分析的张数」
-                val remaining = (serviceProgress.total - serviceProgress.progress).coerceAtLeast(0)
+            AnalysisService.analysisState.collect { p ->
+                val remaining = (p.total - p.progress).coerceAtLeast(0)
                 _state.value = _state.value.copy(
-                    isAnalyzing = serviceProgress.isRunning,
-                    analysisProgress = serviceProgress.progress,
-                    analysisTotal = serviceProgress.total,
-                    doneCount = serviceProgress.progress,
+                    isAnalyzing = p.isRunning,
+                    analysisProgress = p.progress,
+                    analysisTotal = p.total,
+                    doneCount = p.progress,
                     pendingCount = remaining,
-                    hasAnalyzed = serviceProgress.isComplete ||
-                            serviceProgress.progress > 0 ||
-                            _state.value.hasAnalyzed ||
-                            AnalysisService.analyzedMetadata.isNotEmpty(),
-                    canResume = if (serviceProgress.isRunning || serviceProgress.isComplete) false
-                    else remaining > 0 && serviceProgress.progress > 0
+                    hasAnalyzed = p.isComplete || p.progress > 0 ||
+                            _state.value.hasAnalyzed || metadataCache.isNotEmpty(),
+                    // 守护开启时 pending 会被自动处理，无需再显示「继续」
+                    canResume = if (p.isRunning || p.isComplete || _state.value.backgroundWatchActive) false
+                    else remaining > 0 && p.progress > 0
                 )
-
-                // v3.8.0：分析期间绝不跑全量 map / 全库检索，只更新进度条；
-                // 完成（或服务停止且有结果）时做一次全量合并。
-                if (serviceProgress.isComplete ||
-                    (!serviceProgress.isRunning && serviceProgress.progress > 0 &&
-                            serviceProgress.progress - lastSyncedProgress >= SYNC_PROGRESS_STEP)
-                ) {
-                    lastSyncedProgress = serviceProgress.progress
-                    syncServiceResults()
-                }
             }
         }
     }
 
-    private fun syncServiceResults() {
+    /**
+     * v3.10.0：后台分析 → 前端的三类增量事件。磁盘是唯一权威，事件只是运行期加速，
+     * 丢失也不影响正确性（冷启动 loadPhotos 会读全量）。
+     */
+    private fun observeAnalysisEvents() {
         viewModelScope.launch {
-            val snapshot = _state.value.allPhotos
-            val merged = withContext(Dispatchers.Default) {
-                metadataCache.putAll(AnalysisService.analyzedMetadata)
-                snapshot.map { photo ->
-                    val metadata = metadataCache[photo.id]
-                    if (metadata != null && metadata.isAnalyzed) {
-                        photo.copy(labels = metadata.labels, metadata = metadata, isAnalyzed = true)
-                    } else photo
-                }
+            AnalysisEvents.results.collect { batch -> absorbIncrement(batch) }
+        }
+        viewModelScope.launch {
+            AnalysisEvents.albumChanges.collect { onAlbumChanged() }
+        }
+        viewModelScope.launch {
+            AnalysisEvents.watchState.collect { w ->
+                _state.value = _state.value.copy(
+                    backgroundWatchActive = w.active,
+                    autoAnalyzedCount = w.autoAnalyzed,
+                    canResume = if (w.active) false else _state.value.canResume
+                )
             }
-            val plan = withContext(Dispatchers.Default) { computePlan(snapshot) }
-            _state.value = _state.value.copy(
-                allPhotos = merged,
-                canResume = plan.resumed,
-                savedProgress = plan.doneCount,
-                savedTotal = plan.totalCount,
-                doneCount = plan.doneCount,
-                pendingCount = plan.pendingCount,
-                hasAnalyzed = plan.doneCount > 0 || _state.value.hasAnalyzed
-            )
-            docCache.clear()
-            scheduleFilters(0)
         }
     }
 
-    fun startAnalysis() {
-        if (_state.value.isAnalyzing || AnalysisService.isRunning()) return
-        val context = getApplication<Application>()
-        val serviceIntent = Intent(context, AnalysisService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(serviceIntent)
-        } else {
-            context.startService(serviceIntent)
+    /**
+     * 增量吸收一批分析结果 —— 「后台分析不影响前端搜索」的核心。
+     *  1. metadataCache 只 putAll 这 k 张（O(k)），不碰全库；
+     *  2. 只 invalidate 这 k 张的文档缓存，**绝不全量 clear**（否则下一条查询
+     *     会重建几万张索引）；
+     *  3. O(N) 的列表更新放 Dispatchers.Default，主线程只做 O(1) 状态写入；
+     *  4. 无活动查询时直接替换列表、完全不跑检索；有查询时才后台防抖重排，
+     *     用户输入期间不会叠加、不会阻塞。
+     */
+    private suspend fun absorbIncrement(batch: AnalysisEvents.ResultBatch) {
+        if (batch.results.isEmpty()) return
+        metadataCache.putAll(batch.results)
+        docCache.invalidate(IncrementBuffer.idsToInvalidate(batch.results))
+
+        val st = _state.value
+        val hasQuery = st.searchQuery.isNotBlank() || st.timeRange != null || st.locationQuery != null
+        val (merged, done) = withContext(Dispatchers.Default) {
+            val list = st.allPhotos.map { p ->
+                batch.results[p.id]?.let { m ->
+                    p.copy(labels = m.labels, metadata = m, isAnalyzed = true)
+                } ?: p
+            }
+            list to list.count { metadataCache.containsKey(it.id) }
         }
+        _state.value = st.copy(
+            allPhotos = merged,
+            filteredPhotos = if (hasQuery) st.filteredPhotos else merged,
+            hasAnalyzed = true,
+            doneCount = done,
+            pendingCount = (merged.size - done).coerceAtLeast(0)
+        )
+        if (hasQuery) scheduleFilters(SEARCH_DEBOUNCE_MS)
+    }
+
+    /** 相册变化：增量刷新列表，新照片立即显示、删除的移除，O(N) 计算放后台。 */
+    private suspend fun onAlbumChanged() {
+        if (_state.value.isAlbumRefreshing) return
+        _state.value = _state.value.copy(isAlbumRefreshing = true)
+        try {
+            val photos = repository.loadAllPhotos()
+            val snapshot = _state.value.allPhotos
+            val st = _state.value
+            val refresh = withContext(Dispatchers.Default) {
+                val byCurrent = snapshot.associateBy { it.id }
+                val freshIds = HashSet<Long>(photos.size * 2)
+                photos.forEach { freshIds.add(it.id) }
+                val removedIds = byCurrent.keys.filter { it !in freshIds }
+                val added = photos.filter { it.id !in byCurrent }
+                val merged = photos.map { p -> byCurrent[p.id] ?: decorateWithCache(p) }
+                AlbumRefresh(merged, removedIds, added)
+            }
+
+            if (refresh.removedIds.isNotEmpty()) {
+                refresh.removedIds.forEach { metadataCache.remove(it); exifCache.remove(it) }
+                docCache.invalidate(refresh.removedIds)
+            }
+
+            val hasQuery = st.searchQuery.isNotBlank() || st.timeRange != null || st.locationQuery != null
+            val done = withContext(Dispatchers.Default) {
+                refresh.merged.count { metadataCache.containsKey(it.id) }
+            }
+            _state.value = st.copy(
+                allPhotos = refresh.merged,
+                // 无查询时直接展示新列表；有查询时保留现有结果，交给防抖后台重排
+                filteredPhotos = if (hasQuery) st.filteredPhotos else refresh.merged,
+                isAlbumRefreshing = false,
+                savedProgress = done,
+                savedTotal = refresh.merged.size,
+                doneCount = done,
+                pendingCount = (refresh.merged.size - done).coerceAtLeast(0)
+            )
+
+            if (refresh.added.isNotEmpty()) extractExifIncremental(refresh.added)
+            recomputePlaces()
+            if (hasQuery) scheduleFilters(SEARCH_DEBOUNCE_MS)
+        } catch (e: Exception) {
+            _state.value = _state.value.copy(isAlbumRefreshing = false)
+        }
+    }
+
+    private fun decorateWithCache(p: PhotoItem): PhotoItem {
+        val m = metadataCache[p.id] ?: return p
+        return if (m.isAnalyzed) p.copy(labels = m.labels, metadata = m, isAnalyzed = true) else p
+    }
+
+    /**
+     * 只给新照片提取 EXIF：直接写同一个并发 Map 引用 + 增量 append 落盘，
+     * 不重新 load() 全量缓存，也不清空检索缓存 —— 几万张下仍是 O(新增数)。
+     */
+    private fun extractExifIncremental(photos: List<PhotoItem>) {
+        viewModelScope.launch {
+            val app = getApplication<Application>()
+            val buffer = ArrayList<PhotoExif>(photos.size)
+            withContext(Dispatchers.IO) {
+                photos.forEach { p ->
+                    ensureActive()
+                    val e = try {
+                        ExifReader.read(app, p)
+                    } catch (_: Exception) {
+                        PhotoExif(
+                            photoId = p.id,
+                            dateTaken = effectiveTimeOf(p, null),
+                            dateSource = "mediastore"
+                        )
+                    }
+                    exifCache[p.id] = e
+                    buffer.add(e)
+                }
+                if (buffer.isNotEmpty()) exifStore.append(buffer)
+            }
+            _state.value = _state.value.copy(
+                exifMap = exifCache,
+                exifVersion = _state.value.exifVersion + 1
+            )
+            recomputePlaces()
+        }
+    }
+
+    /** 手动「开始/继续分析」：确保守护运行并立即对账一次。 */
+    fun startAnalysis() {
+        val context = getApplication<Application>()
+        if (!AnalysisService.isWatchActive()) {
+            AnalysisService.requestWatch(context)
+        } else {
+            AnalysisService.requestScan(context)
+        }
+        // 立即反馈，随后由 analysisState 事件校准
         _state.value = _state.value.copy(isAnalyzing = true)
     }
 
-    /** 「继续分析」与「开始分析」走同一入口：Service 自己按 photoId 差集决定从哪开始。 */
+    /** 「继续分析」与「开始分析」走同一入口：Service 按 photoId 差集决定从哪开始。 */
     fun resumeAnalysis() = startAnalysis()
 
     /**
-     * v3.9.0：应用回到前台时自动续跑。
-     * 只续「已经开始过、但还剩照片没分析」的任务（plan.resumed），
-     * 首次安装或全部完成时都不会擅自启动，避免云端 AI 偷跑流量。
-     * 可在设置里关闭「自动继续未完成的照片分析」。
+     * v3.10.0：应用回到前台时确保后台守护在运行。
+     * - 守护开启（默认）：服务未常驻则拉起；开机启动受限留下的 pending 触发一次对账。
+     * - 守护关闭：沿用 v3.9.0 的「自动继续未完成分析」降级 —— 若仍有未分析照片或
+     *   存在 pending，启动一次性服务续跑（开关关闭时服务跑完即退，不常驻）。
+     * 首次安装、已全部分析完成、且开关都关闭时都不会擅自启动云端 AI。
      */
-    fun autoResumeIfNeeded() {
-        resumeRequested = true
+    fun ensureBackgroundWatch() {
         val app = getApplication<Application>()
+        val watch = AppConfig.isBackgroundWatchEnabled(app)
+        val autoResume = AppConfig.isAutoResumeEnabled(app)
         _state.value = _state.value.copy(
-            autoResumeEnabled = AppConfig.isAutoResumeEnabled(app)
+            autoResumeEnabled = autoResume,
+            backgroundWatchEnabled = watch
         )
-        if (_state.value.allPhotos.isNotEmpty()) performAutoResume()
+        val pending = AppConfig.isWatchPending(app)
+        if (watch) {
+            if (!AnalysisService.isWatchActive()) {
+                AnalysisService.requestWatch(app)
+            } else if (pending) {
+                AppConfig.setWatchPending(app, false)
+                AnalysisService.requestScan(app)
+            }
+        } else if (autoResume && !AnalysisService.isRunning()) {
+            val plan = computePlan(_state.value.allPhotos)
+            if (plan.resumed || pending) {
+                AppConfig.setWatchPending(app, false)
+                AnalysisService.requestWatch(app)
+            }
+        }
     }
 
-    private fun performAutoResume() {
+    /** 兼容旧调用名（MainActivity.onResume）。 */
+    fun autoResumeIfNeeded() = ensureBackgroundWatch()
+
+    /** 设置页开关：立即启停常驻守护。 */
+    fun setBackgroundWatch(enabled: Boolean) {
         val app = getApplication<Application>()
-        if (!AppConfig.isAutoResumeEnabled(app)) return
-        val st = _state.value
-        if (st.isAnalyzing || AnalysisService.isRunning() || st.allPhotos.isEmpty()) return
-        val plan = computePlan(st.allPhotos)
-        _state.value = st.copy(
-            doneCount = plan.doneCount,
-            pendingCount = plan.pendingCount,
-            savedProgress = plan.doneCount,
-            savedTotal = plan.totalCount,
-            hasAnalyzed = plan.doneCount > 0 || st.hasAnalyzed,
-            canResume = plan.resumed
-        )
-        if (plan.resumed) startAnalysis()
+        AppConfig.setBackgroundWatchEnabled(app, enabled)
+        _state.value = _state.value.copy(backgroundWatchEnabled = enabled)
+        if (enabled) {
+            if (!AnalysisService.isWatchActive()) AnalysisService.requestWatch(app)
+        } else {
+            AnalysisService.requestStop(app)
+            _state.value = _state.value.copy(backgroundWatchActive = false)
+        }
     }
 
+    /** 清空结果全量重跑：磁盘由 Service 单点清理，避免两侧同时 clear 竞态。 */
     fun restartAnalysis() {
-        if (_state.value.isAnalyzing || AnalysisService.isRunning()) return
         viewModelScope.launch {
-            withContext(Dispatchers.IO) { resultStore.clear() }
-            AnalysisService.reset()
             metadataCache.clear()
             docCache.clear()
             val stripped = _state.value.allPhotos.map {
@@ -571,15 +701,17 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
             }
             _state.value = _state.value.copy(
                 allPhotos = stripped,
+                filteredPhotos = stripped,
                 hasAnalyzed = false,
                 canResume = false,
                 savedProgress = 0,
-                savedTotal = 0,
+                savedTotal = stripped.size,
                 doneCount = 0,
                 pendingCount = stripped.size
             )
             scheduleFilters(0)
-            startAnalysis()
+            // Service 自己清磁盘 + 全量重跑；服务未运行时会一并拉起
+            AnalysisService.requestReanalyzeAll(getApplication<Application>())
         }
     }
 

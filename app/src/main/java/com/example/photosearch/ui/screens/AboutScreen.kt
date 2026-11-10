@@ -159,6 +159,17 @@ private data class ReleaseInfo(
 
 private val RELEASES = listOf(
     ReleaseInfo(
+        "v3.10.0", "2026-11-10", "后台自动分析 · 相册监听 · 检索隔离",
+        listOf(
+            "智能分析改为后台常驻守护服务：跑完不退出，被系统回收后自动重启，开机 / 升级自动恢复，通知栏可随时停止",
+            "监听系统相册变化：有新照片加入时自动增量分析并保存结果，已分析过的绝不重跑；新照片立即显示在相册里",
+            "后台分析结果按批增量通知前端：只合并新增的几张、只失效这几张的索引缓存，绝不全量重算，搜索不受影响",
+            "分析跑在低优先级独立线程、检索在独立线程池、主线程只更状态，三者互不抢占、无共享锁",
+            "设置页可开关「后台自动分析」，关闭后回到手动开始 / 回到前台续跑模式；EXIF 也按增量提取",
+            "磁盘仍是结果唯一权威，运行期事件丢失不影响正确性；新增离线评测验证增量合并与索引隔离"
+        )
+    ),
+    ReleaseInfo(
         "v3.9.0", "2026-11-09", "断点续分析 · 版本说明与操作手册",
         listOf(
             "分析按 photoId 差集续跑：中断、退出、被系统终止后，下次只分析没跑过的照片，不再从头开始",
@@ -237,6 +248,6 @@ private fun currentVersion(context: android.content.Context): String {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
         "v${info.versionName} (${info.versionCode})"
     } catch (e: Exception) {
-        "v3.9.0 (12)"
+        "v3.10.0 (13)"
     }
 }

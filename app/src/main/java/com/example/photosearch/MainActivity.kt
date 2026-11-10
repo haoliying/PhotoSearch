@@ -94,7 +94,8 @@ class MainActivity : ComponentActivity() {
                                     context = this@MainActivity,
                                     onBack = { showSettings = false },
                                     onOpenAbout = { showSettings = false; showAbout = true },
-                                    onOpenHelp = { showSettings = false; showHelp = true }
+                                    onOpenHelp = { showSettings = false; showHelp = true },
+                                    onBackgroundWatchChanged = { viewModel.setBackgroundWatch(it) }
                                 )
                             }
                         }
@@ -167,7 +168,12 @@ class MainActivity : ComponentActivity() {
                                 exifMap = state.exifMap,
                                 // v3.8.0
                                 isSearching = state.isSearching,
-                                exifVersion = state.exifVersion
+                                exifVersion = state.exifVersion,
+                                // v3.10.0 后台守护
+                                backgroundWatchActive = state.backgroundWatchActive,
+                                backgroundWatchEnabled = state.backgroundWatchEnabled,
+                                autoAnalyzedCount = state.autoAnalyzedCount,
+                                onToggleWatch = { viewModel.setBackgroundWatch(!state.backgroundWatchEnabled) }
                             )
                         }
                     }
@@ -181,8 +187,9 @@ class MainActivity : ComponentActivity() {
         // 用户可能在系统设置里改过照片权限，或首次授权后返回前台；列表为空时重扫一次
         if (ContextCompat.checkSelfPermission(this, photoPermission()) == PackageManager.PERMISSION_GRANTED) {
             viewModel.reloadIfEmpty()
-            // v3.9.0：上次分析中断后，回到前台自动从剩余照片继续（可在设置里关闭）
-            viewModel.autoResumeIfNeeded()
+            // v3.10.0：确保后台守护常驻（相册监听 + 新照片自动分析）；
+            // 开关关闭时降级为「回到前台续跑未完成的分析」
+            viewModel.ensureBackgroundWatch()
         }
     }
 

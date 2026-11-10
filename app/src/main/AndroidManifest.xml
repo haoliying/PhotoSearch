@@ -16,6 +16,8 @@
     <!-- Foreground service permissions -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- v3.10.0：开机 / 应用升级后恢复「后台自动分析」守护 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:allowBackup="true"
@@ -34,11 +36,23 @@
             </intent-filter>
         </activity>
 
-        <!-- Background analysis service -->
+        <!-- v3.10.0：常驻后台分析守护（划掉任务不终止，监听相册变化） -->
         <service
             android:name=".service.AnalysisService"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- 开机 / 应用升级后尽力恢复后台守护；受限时由 App 前台兜底 -->
+        <receiver
+            android:name=".receiver.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <!-- FileProvider for sharing photos -->
         <provider

@@ -111,7 +111,12 @@ fun HomeScreen(
     exifMap: Map<Long, PhotoExif> = emptyMap(),
     // v3.8.0：后台检索状态 / EXIF 缓存版本（触发列表刷新，避免全量复制）
     isSearching: Boolean = false,
-    exifVersion: Int = 0
+    exifVersion: Int = 0,
+    // v3.10.0 后台守护
+    backgroundWatchActive: Boolean = false,
+    backgroundWatchEnabled: Boolean = true,
+    autoAnalyzedCount: Int = 0,
+    onToggleWatch: () -> Unit = {}
 ) {
     var showSearch by rememberSaveable { mutableStateOf(false) }
     var showFilters by rememberSaveable { mutableStateOf(false) }
@@ -205,6 +210,19 @@ fun HomeScreen(
                                     text = { Text("重新加载相册") },
                                     leadingIcon = { Icon(Icons.Default.PhotoLibrary, null) },
                                     onClick = { showOverflow = false; onReloadPhotos() }
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            when {
+                                                backgroundWatchEnabled && backgroundWatchActive -> "停止后台守护"
+                                                backgroundWatchEnabled -> "启动后台守护"
+                                                else -> "开启后台自动分析"
+                                            }
+                                        )
+                                    },
+                                    leadingIcon = { Icon(Icons.Default.Info, null) },
+                                    onClick = { showOverflow = false; onToggleWatch() }
                                 )
                                 Divider()
                                 DropdownMenuItem(
@@ -323,7 +341,10 @@ fun HomeScreen(
                     onStartAnalysis = onStartAnalysis,
                     onResumeAnalysis = onResumeAnalysis,
                     onRestartAnalysis = onRestartAnalysis,
-                    onOpenHelp = onOpenHelp
+                    onOpenHelp = onOpenHelp,
+                    backgroundWatchActive = backgroundWatchActive,
+                    autoAnalyzedCount = autoAnalyzedCount,
+                    onToggleWatch = onToggleWatch
                 )
             }
 
@@ -756,7 +777,10 @@ private fun AnalysisStatusBar(
     onStartAnalysis: () -> Unit,
     onResumeAnalysis: () -> Unit,
     onRestartAnalysis: () -> Unit,
-    onOpenHelp: () -> Unit
+    onOpenHelp: () -> Unit,
+    backgroundWatchActive: Boolean,
+    autoAnalyzedCount: Int,
+    onToggleWatch: () -> Unit
 ) {
     when {
         // v3.9.0：进度口径是「相册里已完整分析的张数」，不是本轮处理序号
@@ -811,7 +835,29 @@ private fun AnalysisStatusBar(
                     color = OnSurface.copy(alpha = 0.55f))
             }
         }
-        // 分析完成且无待分析照片：不占任何空间，把屏幕留给照片
+        // v3.10.0：后台守护运行中且无待分析照片 —— 只占极轻的一行，
+        // 明确告知「新增照片会自动分析、不影响搜索」，并提供停止入口
+        backgroundWatchActive -> Surface(color = Surface) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    if (autoAnalyzedCount > 0)
+                        "后台守护中 · 本次已自动分析 $autoAnalyzedCount 张，新增照片会自动分析（不影响搜索）"
+                    else
+                        "后台守护中 · 新增照片会自动分析（不影响搜索）",
+                    fontSize = 10.sp,
+                    color = OnSurface.copy(alpha = 0.55f),
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(
+                    onClick = onToggleWatch,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                ) { Text("停止", fontSize = 10.sp) }
+            }
+        }
+        // 分析完成且守护关闭：不占任何空间，把屏幕留给照片
         else -> Unit
     }
 }

@@ -80,4 +80,29 @@ object AnalysisPlanner {
             retryVlmCount = retryVlm
         )
     }
+
+    /**
+     * v3.10.0：相册变化检测。
+     * ContentObserver 只回调「某处变了」，不携带具体增删；后台守护重新查一次
+     * MediaStore 拿到当前 id 列表后，用上一次快照求差，得到真正新增 / 删除的 id，
+     * 用于：① 判断是否需要通知前端增量刷新列表；② 避免元数据变更误触发全量重跑。
+     * 纯逻辑，可离线评测（新增、删除、无变化、乱序、重复）。
+     */
+    data class AlbumDelta(
+        val added: List<Long>,
+        val removed: List<Long>,
+        val currentCount: Int
+    ) {
+        val changed: Boolean get() = added.isNotEmpty() || removed.isNotEmpty()
+    }
+
+    fun diff(previousIds: Set<Long>, currentIds: List<Long>): AlbumDelta {
+        val current = LinkedHashSet<Long>(currentIds.size * 2)
+        currentIds.forEach { current.add(it) }              // 去重且保序
+        val added = ArrayList<Long>()
+        for (id in current) if (id !in previousIds) added.add(id)
+        val removed = ArrayList<Long>()
+        for (id in previousIds) if (id !in current) removed.add(id)
+        return AlbumDelta(added, removed, current.size)
+    }
 }

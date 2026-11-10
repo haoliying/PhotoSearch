@@ -7,9 +7,9 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 版本名 | 3.9.0 |
-| versionCode | 12 |
-| 发布日期 | 2026-11-09 |
+| 版本名 | 3.10.0 |
+| versionCode | 13 |
+| 发布日期 | 2026-11-10 |
 | 包名 | `com.example.photosearch` |
 | 最低 Android | API 26（Android 8.0） |
 | 编译目标 | API 34 |
@@ -19,6 +19,7 @@
 
 | 版本 | 日期 | 主题 | 详细文档 |
 | --- | --- | --- | --- |
+| v3.10.0 | 2026-11-10 | 后台常驻自动分析、相册变化监听、检索隔离 | [CHANGELOG_v3.10.0.md](CHANGELOG_v3.10.0.md) · [BACKGROUND_ANALYSIS.md](BACKGROUND_ANALYSIS.md) |
 | v3.9.0 | 2026-11-09 | 断点续分析、版本说明与操作手册 | [CHANGELOG_v3.9.0.md](CHANGELOG_v3.9.0.md) |
 | v3.8.0 | 2026-11-09 | 修复搜索假死，支持几万张照片 | [CHANGELOG_v3.8.0.md](CHANGELOG_v3.8.0.md) |
 | v3.7.0 | 2026-11-08 | 中文标签、EXIF 扩展、界面重构、右滑返回 | [CHANGELOG_v3.7.0.md](CHANGELOG_v3.7.0.md) |
@@ -27,6 +28,23 @@
 | v3.5.1 | 2026-11-07 | 修复相册照片不可见 | — |
 | v3.5.0 | 2026-11-07 | 搜索准确度修复、首个签名发行版 | [SEARCH_ACCURACY.md](SEARCH_ACCURACY.md) |
 | v3.1 及更早 | 初始版本 | 相册扫描、本地标签、VLM 描述、自然语言检索 | — |
+
+---
+
+## v3.10.0 · 后台自动分析 · 相册监听 · 检索隔离
+
+**解决的问题**：分析要能在后台常驻运行、自动发现并分析新照片，且不能影响前端搜索。
+
+- `AnalysisService` 改为 `START_STICKY` 常驻守护，跑完不退出；新增 `MediaStoreObserver`
+  （ContentObserver + 1.5s 防抖）监听相册，`BootReceiver` 开机/升级恢复，App 回到前台兜底拉起。
+- 相册变化 → 重新查 MediaStore → `AnalysisPlanner.diff/plan` 只挑新增照片 → 逐张落盘保存；
+  新照片立即显示在相册里，AI 描述与 EXIF 随后自动补齐。
+- **三层隔离**保证搜索不受影响：分析跑低优先级独立线程；服务只写自己的磁盘 Store，
+  不碰前端检索快照；结果按批增量通知前端，只 `invalidate` 新增的几张文档缓存，
+  **绝不全量 `clear()` + 全库重算**（删除旧版 `syncServiceResults()` 路径）。
+- 设置页 / 首页菜单 / 通知栏均可停止守护；关闭后回到 v3.9.0 一次性分析 + 前台续跑模式。
+- 详细架构、系统限制与降级见 [BACKGROUND_ANALYSIS.md](BACKGROUND_ANALYSIS.md)，
+  完整变更见 [CHANGELOG_v3.10.0.md](CHANGELOG_v3.10.0.md)；离线评测 `BackgroundEval` 46/46 PASS。
 
 ---
 

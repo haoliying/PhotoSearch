@@ -14,6 +14,10 @@ object AppConfig {
     private const val KEY_USE_VLM = "use_vlm"
     private const val KEY_AUTO_RESUME = "auto_resume_analysis"
     private const val DEFAULT_SEGMENT_SIZE = 200
+    // v3.10.0：后台自动分析守护
+    private const val KEY_BACKGROUND_WATCH = "background_watch_enabled"
+    private const val KEY_WATCH_EVER_STARTED = "background_watch_ever_started"
+    private const val KEY_WATCH_PENDING = "background_watch_pending"
 
     private fun prefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -65,5 +69,39 @@ object AppConfig {
 
     fun setAutoResumeEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_AUTO_RESUME, enabled).apply()
+    }
+
+    /**
+     * v3.10.0：后台自动分析守护开关。默认开启（用户明确要求后台运行 + 新照片自动分析）。
+     * 关闭后服务停止常驻，分析回到「手动开始 / 回到前台续跑」模式。
+     * 只有在照片权限已授予、且 App 曾在前台主动拉起过守护后才会真正常驻，
+     * 首次安装不会在后台擅自启动云端 AI 偷跑流量。
+     */
+    fun isBackgroundWatchEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_BACKGROUND_WATCH, true)
+    }
+
+    fun setBackgroundWatchEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_BACKGROUND_WATCH, enabled).apply()
+    }
+
+    /** 用户是否曾经启用过守护；开机广播据此决定是否尝试恢复。 */
+    fun wasWatchEverStarted(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_WATCH_EVER_STARTED, false)
+    }
+
+    fun markWatchStarted(context: Context) {
+        if (!wasWatchEverStarted(context)) {
+            prefs(context).edit().putBoolean(KEY_WATCH_EVER_STARTED, true).apply()
+        }
+    }
+
+    /** 开机 / 升级后台启动受系统限制时置位，App 下次回到前台兜底恢复守护。 */
+    fun isWatchPending(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_WATCH_PENDING, false)
+    }
+
+    fun setWatchPending(context: Context, pending: Boolean) {
+        prefs(context).edit().putBoolean(KEY_WATCH_PENDING, pending).apply()
     }
 }

@@ -24,13 +24,15 @@ fun SettingsScreen(
     context: android.content.Context,
     onBack: () -> Unit,
     onOpenAbout: () -> Unit = {},
-    onOpenHelp: () -> Unit = {}
+    onOpenHelp: () -> Unit = {},
+    onBackgroundWatchChanged: (Boolean) -> Unit = {}
 ) {
     var apiKey by remember { mutableStateOf(AppConfig.getApiKey(context)) }
     var apiProvider by remember { mutableStateOf(AppConfig.getApiProvider(context)) }
     var vlmEnabled by remember { mutableStateOf(AppConfig.isVlmEnabled(context)) }
     var segmentSize by remember { mutableStateOf(AppConfig.getSegmentSize(context).toString()) }
     var autoResume by remember { mutableStateOf(AppConfig.isAutoResumeEnabled(context)) }
+    var backgroundWatch by remember { mutableStateOf(AppConfig.isBackgroundWatchEnabled(context)) }
     var saved by remember { mutableStateOf(false) }
 
     val providers = VisionLanguageAnalyzer.PROVIDERS
@@ -203,6 +205,54 @@ fun SettingsScreen(
                 }
             }
 
+            // v3.10.0 后台自动分析守护
+            Text(
+                text = "后台运行",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = OnSurface
+            )
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Surface)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "后台自动分析（守护常驻）",
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = "开启后分析服务在后台常驻并监听相册：新拍或新下载的照片会自动增量分析并保存结果，无需手动点「开始分析」。后台分析跑在低优先级线程、只增量更新，不会打断前端搜索。关闭后回到「手动开始 / 回到前台续跑」模式。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = OnSurface.copy(alpha = 0.6f)
+                            )
+                        }
+                        Switch(checked = backgroundWatch, onCheckedChange = {
+                            backgroundWatch = it
+                            saved = false
+                            // 开关即时生效，不必等保存按钮
+                            AppConfig.setBackgroundWatchEnabled(context, it)
+                            onBackgroundWatchChanged(it)
+                        })
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "系统通知栏会显示一条低优先级「后台守护」通知，可点「停止守护」随时关闭；开机后自动恢复（部分系统需打开一次应用）。云端 AI 开启时后台自动分析会消耗流量，请按需使用。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OnSurface.copy(alpha = 0.6f)
+                    )
+                }
+            }
+
             // v3.9.0 断点续分析设置
             Text(
                 text = "分析进度",
@@ -229,7 +279,7 @@ fun SettingsScreen(
                                 fontWeight = FontWeight.Medium
                             )
                             Text(
-                                text = "回到应用时从上次剩余的照片接着分析，不会从头开始；新增照片也只分析新增的。关闭后可在首页点「继续」。",
+                                text = "守护关闭时生效：回到应用从上次剩余的照片接着分析，不会从头开始。开启上面的「后台自动分析」后由守护自动接管（推荐）。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = OnSurface.copy(alpha = 0.6f)
                             )
@@ -249,6 +299,7 @@ fun SettingsScreen(
                     AppConfig.setApiProvider(context, apiProvider)
                     AppConfig.setApiKey(context, apiKey)
                     AppConfig.setAutoResumeEnabled(context, autoResume)
+                    AppConfig.setBackgroundWatchEnabled(context, backgroundWatch)
                     val size = segmentSize.toIntOrNull()
                     if (size != null && size > 0) {
                         AppConfig.setSegmentSize(context, size)
