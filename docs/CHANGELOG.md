@@ -7,9 +7,9 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 版本名 | 3.10.0 |
-| versionCode | 13 |
-| 发布日期 | 2026-11-10 |
+| 版本名 | 3.11.0 |
+| versionCode | 14 |
+| 发布日期 | 2026-11-11 |
 | 包名 | `com.example.photosearch` |
 | 最低 Android | API 26（Android 8.0） |
 | 编译目标 | API 34 |
@@ -19,6 +19,7 @@
 
 | 版本 | 日期 | 主题 | 详细文档 |
 | --- | --- | --- | --- |
+| v3.11.0 | 2026-11-11 | 大模型使用策略、选择照片交给大模型、不依赖大模型的准确度增强 | [CHANGELOG_v3.11.0.md](CHANGELOG_v3.11.0.md) · [ACCURACY_WITHOUT_VLM.md](ACCURACY_WITHOUT_VLM.md) |
 | v3.10.0 | 2026-11-10 | 后台常驻自动分析、相册变化监听、检索隔离 | [CHANGELOG_v3.10.0.md](CHANGELOG_v3.10.0.md) · [BACKGROUND_ANALYSIS.md](BACKGROUND_ANALYSIS.md) |
 | v3.9.0 | 2026-11-09 | 断点续分析、版本说明与操作手册 | [CHANGELOG_v3.9.0.md](CHANGELOG_v3.9.0.md) |
 | v3.8.0 | 2026-11-09 | 修复搜索假死，支持几万张照片 | [CHANGELOG_v3.8.0.md](CHANGELOG_v3.8.0.md) |

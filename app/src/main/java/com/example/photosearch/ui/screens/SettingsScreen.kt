@@ -1,6 +1,7 @@
 package com.example.photosearch.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -16,8 +17,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.photosearch.data.AppConfig
 import com.example.photosearch.ml.VisionLanguageAnalyzer
+import com.example.photosearch.search.VlmMode
 import com.example.photosearch.ui.theme.*
 
+/**
+ * v3.11.0：把「启用云端 AI 分析」的单个开关升级为完整的大模型使用策略：
+ * 可以选择使用 / 不使用，以及哪些照片交给大模型；并新增不依赖大模型的
+ * 本地准确度增强开关。
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
@@ -25,11 +32,17 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onOpenAbout: () -> Unit = {},
     onOpenHelp: () -> Unit = {},
-    onBackgroundWatchChanged: (Boolean) -> Unit = {}
+    onBackgroundWatchChanged: (Boolean) -> Unit = {},
+    onVlmConfigChanged: () -> Unit = {}
 ) {
     var apiKey by remember { mutableStateOf(AppConfig.getApiKey(context)) }
     var apiProvider by remember { mutableStateOf(AppConfig.getApiProvider(context)) }
-    var vlmEnabled by remember { mutableStateOf(AppConfig.isVlmEnabled(context)) }
+    var modeId by remember { mutableStateOf(AppConfig.getVlmModeId(context)) }
+    var thresholdPct by remember {
+        mutableStateOf((AppConfig.getUncertainThreshold(context) * 100).toInt().toString())
+    }
+    var wifiOnly by remember { mutableStateOf(AppConfig.isVlmWifiOnly(context)) }
+    var localEnhance by remember { mutableStateOf(AppConfig.isLocalEnhanceEnabled(context)) }
     var segmentSize by remember { mutableStateOf(AppConfig.getSegmentSize(context).toString()) }
     var autoResume by remember { mutableStateOf(AppConfig.isAutoResumeEnabled(context)) }
     var backgroundWatch by remember { mutableStateOf(AppConfig.isBackgroundWatchEnabled(context)) }
@@ -38,6 +51,8 @@ fun SettingsScreen(
     val providers = VisionLanguageAnalyzer.PROVIDERS
     val selectedProvider = providers.find { it.id == apiProvider } ?: providers[0]
     val versionText = remember { appVersion(context) }
+    val mode = VlmMode.fromId(modeId)
+    val selectedCount = remember(modeId, saved) { AppConfig.getVlmSelectedIds(context).size }
 
     Scaffold(
         topBar = {
@@ -61,117 +76,9 @@ fun SettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // AI Analysis Settings
+            // ---------------- 大模型使用方式 ----------------
             Text(
-                text = "AI 分析设置",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = OnSurface
-            )
-
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(containerColor = Surface)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    // VLM Enable/Disable
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "启用云端 AI 分析",
-                                style = MaterialTheme.typography.bodyLarge,
-                                fontWeight = FontWeight.Medium
-                            )
-                            Text(
-                                text = "使用大语言模型分析照片内容，大幅提升搜索准确度",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = OnSurface.copy(alpha = 0.6f)
-                            )
-                        }
-                        Switch(
-                            checked = vlmEnabled,
-                            onCheckedChange = { vlmEnabled = it }
-                        )
-                    }
-
-                    if (vlmEnabled) {
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Divider()
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        // Provider selection
-                        Text(
-                            text = "选择 AI 服务",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Medium
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        // Provider chips in a column for readability
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            providers.forEach { provider ->
-                                FilterChip(
-                                    selected = apiProvider == provider.id,
-                                    onClick = {
-                                        apiProvider = provider.id
-                                        saved = false
-                                    },
-                                    label = {
-                                        Text(
-                                            text = provider.displayName,
-                                            fontSize = if (apiProvider == provider.id)
-                                                MaterialTheme.typography.bodyMedium.fontSize
-                                                else MaterialTheme.typography.bodySmall.fontSize
-                                        )
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-                        // Show selected provider info
-                        Text(
-                            text = selectedProvider.freeInfo,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Primary,
-                            fontWeight = FontWeight.Medium
-                        )
-
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        // API Key input
-                        OutlinedTextField(
-                            value = apiKey,
-                            onValueChange = {
-                                apiKey = it
-                                saved = false
-                            },
-                            label = { Text("API Key") },
-                            placeholder = { Text("粘贴你的 API Key") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(8.dp)
-                        )
-
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "获取 API Key: ${selectedProvider.apiKeyUrl}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Primary
-                        )
-                    }
-                }
-            }
-
-            // Storage settings
-            Text(
-                text = "存储设置",
+                text = "大模型使用方式",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
                 color = OnSurface
@@ -184,10 +91,218 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "进度标记刷新间隔",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Medium
+                        text = "选择是否使用云端大模型，以及哪些照片交给它分析。关闭后完全走端侧识别，不联网、不消耗流量。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OnSurface.copy(alpha = 0.6f)
                     )
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    VlmMode.values().forEach { m ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { modeId = m.id; saved = false }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = modeId == m.id,
+                                onClick = { modeId = m.id; saved = false }
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = m.label,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = if (modeId == m.id) FontWeight.Bold else FontWeight.Medium
+                                )
+                                if (modeId == m.id) {
+                                    Text(
+                                        text = m.hint,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = OnSurface.copy(alpha = 0.6f)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // UNCERTAIN 专属：可信度阈值
+                    if (mode == VlmMode.UNCERTAIN) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Divider()
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text(
+                            text = "识别可信度阈值（%）",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            text = "端侧识别可信度低于此值的照片才会调用大模型。数值越大，交给大模型的照片越多。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = OnSurface.copy(alpha = 0.6f)
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = thresholdPct,
+                            onValueChange = { thresholdPct = it.filter { c -> c.isDigit() }.take(3); saved = false },
+                            label = { Text("阈值 0 - 100") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(8.dp)
+                        )
+                    }
+
+                    // SELECTED 专属：手动选择说明
+                    if (mode == VlmMode.SELECTED) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Divider()
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text(
+                            text = "当前待大模型分析的照片：$selectedCount 张",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Primary,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            text = "回到相册 → 右上角菜单「多选照片」→ 勾选后点底部「用大模型分析所选」。无论当前是哪种策略，手动勾选的照片都会被强制精修。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = OnSurface.copy(alpha = 0.6f)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Divider()
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("仅 Wi-Fi 下使用大模型", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "开启后移动数据下自动跳过云端分析，避免偷跑流量；后台守护会在连上 Wi-Fi 后补上。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = OnSurface.copy(alpha = 0.6f)
+                            )
+                        }
+                        Switch(checked = wifiOnly, onCheckedChange = { wifiOnly = it; saved = false })
+                    }
+                }
+            }
+
+            // ---------------- 不依赖大模型的准确度增强 ----------------
+            Text(
+                text = "本地识别准确度（无需大模型）",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = OnSurface
+            )
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Surface)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("启用本地准确度增强", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                            Text(
+                                "把端侧已经算出但过去被浪费的信号（主色 / 明暗 / 横竖幅 / 人数 / 文字 / 多场景 / 低置信标签）编成中文标签，并在查询时扩展同义词。完全离线、不联网，升级后旧分析结果无需重跑即可生效。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = OnSurface.copy(alpha = 0.6f)
+                            )
+                        }
+                        Switch(checked = localEnhance, onCheckedChange = { localEnhance = it; saved = false })
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "关闭后检索行为与 v3.10.0 完全一致，可用于对比准确度。详细原理见「操作手册」。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Secondary
+                    )
+                }
+            }
+
+            // ---------------- 云端服务配置（仅策略非 OFF 时显示） ----------------
+            if (mode != VlmMode.OFF) {
+                Text(
+                    text = "云端服务配置",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = OnSurface
+                )
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Surface)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("选择 AI 服务", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            providers.forEach { provider ->
+                                FilterChip(
+                                    selected = apiProvider == provider.id,
+                                    onClick = { apiProvider = provider.id; saved = false },
+                                    label = {
+                                        Text(
+                                            text = provider.displayName,
+                                            fontSize = if (apiProvider == provider.id)
+                                                MaterialTheme.typography.bodyMedium.fontSize
+                                            else MaterialTheme.typography.bodySmall.fontSize
+                                        )
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = selectedProvider.freeInfo,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Primary,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = apiKey,
+                            onValueChange = { apiKey = it; saved = false },
+                            label = { Text("API Key") },
+                            placeholder = { Text("粘贴你的 API Key") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(8.dp)
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "获取 API Key: ${selectedProvider.apiKeyUrl}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Primary
+                        )
+                    }
+                }
+            }
+
+            // ---------------- 存储设置 ----------------
+            Text(
+                text = "存储设置",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = OnSurface
+            )
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Surface)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("进度标记刷新间隔", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                     Text(
                         text = "v3.9.0 起每张照片分析完立即单独保存，退出或中断都不会丢进度。此项只控制进度数字多久写一次，不影响安全性。",
                         style = MaterialTheme.typography.bodySmall,
@@ -205,14 +320,13 @@ fun SettingsScreen(
                 }
             }
 
-            // v3.10.0 后台自动分析守护
+            // ---------------- 后台运行 ----------------
             Text(
                 text = "后台运行",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
                 color = OnSurface
             )
-
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp),
@@ -225,11 +339,7 @@ fun SettingsScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "后台自动分析（守护常驻）",
-                                style = MaterialTheme.typography.bodyLarge,
-                                fontWeight = FontWeight.Medium
-                            )
+                            Text("后台自动分析（守护常驻）", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
                             Text(
                                 text = "开启后分析服务在后台常驻并监听相册：新拍或新下载的照片会自动增量分析并保存结果，无需手动点「开始分析」。后台分析跑在低优先级线程、只增量更新，不会打断前端搜索。关闭后回到「手动开始 / 回到前台续跑」模式。",
                                 style = MaterialTheme.typography.bodySmall,
@@ -239,7 +349,6 @@ fun SettingsScreen(
                         Switch(checked = backgroundWatch, onCheckedChange = {
                             backgroundWatch = it
                             saved = false
-                            // 开关即时生效，不必等保存按钮
                             AppConfig.setBackgroundWatchEnabled(context, it)
                             onBackgroundWatchChanged(it)
                         })
@@ -253,14 +362,13 @@ fun SettingsScreen(
                 }
             }
 
-            // v3.9.0 断点续分析设置
+            // ---------------- 分析进度 ----------------
             Text(
                 text = "分析进度",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
                 color = OnSurface
             )
-
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp),
@@ -273,77 +381,60 @@ fun SettingsScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "自动继续未完成的照片分析",
-                                style = MaterialTheme.typography.bodyLarge,
-                                fontWeight = FontWeight.Medium
-                            )
+                            Text("自动继续未完成的照片分析", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
                             Text(
                                 text = "守护关闭时生效：回到应用从上次剩余的照片接着分析，不会从头开始。开启上面的「后台自动分析」后由守护自动接管（推荐）。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = OnSurface.copy(alpha = 0.6f)
                             )
                         }
-                        Switch(checked = autoResume, onCheckedChange = {
-                            autoResume = it
-                            saved = false
-                        })
+                        Switch(checked = autoResume, onCheckedChange = { autoResume = it; saved = false })
                     }
                 }
             }
 
-            // Save button
+            // ---------------- 保存 ----------------
             Button(
                 onClick = {
-                    AppConfig.setVlmEnabled(context, vlmEnabled)
+                    AppConfig.setVlmModeId(context, modeId)
                     AppConfig.setApiProvider(context, apiProvider)
                     AppConfig.setApiKey(context, apiKey)
+                    thresholdPct.toIntOrNull()?.let {
+                        AppConfig.setUncertainThreshold(context, it.coerceIn(0, 100) / 100f)
+                    }
+                    AppConfig.setVlmWifiOnly(context, wifiOnly)
+                    AppConfig.setLocalEnhanceEnabled(context, localEnhance)
                     AppConfig.setAutoResumeEnabled(context, autoResume)
                     AppConfig.setBackgroundWatchEnabled(context, backgroundWatch)
                     val size = segmentSize.toIntOrNull()
-                    if (size != null && size > 0) {
-                        AppConfig.setSegmentSize(context, size)
-                    }
+                    if (size != null && size > 0) AppConfig.setSegmentSize(context, size)
                     saved = true
+                    onVlmConfigChanged()
                 },
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Primary),
                 shape = RoundedCornerShape(8.dp)
             ) {
-                Text(if (saved) "已保存 ✓" else "保存设置")
+                Text(if (saved) "已保存并生效 ✓" else "保存设置")
             }
 
-            // Info section
+            // ---------------- 关于 ----------------
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp),
                 colors = CardDefaults.cardColors(containerColor = Surface)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "关于",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Text("关于", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "智能相册搜索 $versionText",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
+                    Text("智能相册搜索 $versionText", style = MaterialTheme.typography.bodyMedium)
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "使用 ML Kit 本地图像识别 + 云端大语言模型生成中文照片描述，实现高精度自然语言搜索。",
+                        text = "ML Kit 端侧识别 + 本地视觉/语义增强，可按策略叠加云端大模型精修；两者都能独立工作。",
                         style = MaterialTheme.typography.bodySmall,
                         color = OnSurface.copy(alpha = 0.6f)
                     )
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "推荐：智谱AI 的 glm-4v-flash 模型完全免费，适合日常使用。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Secondary,
-                        fontWeight = FontWeight.Medium
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         TextButton(onClick = onOpenHelp) { Text("操作手册") }
                         TextButton(onClick = onOpenAbout) { Text("版本说明") }
@@ -363,6 +454,6 @@ private fun appVersion(context: android.content.Context): String {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
         "v${info.versionName} (${info.versionCode})"
     } catch (e: Exception) {
-        "v3.9.0"
+        "v3.11.0"
     }
 }

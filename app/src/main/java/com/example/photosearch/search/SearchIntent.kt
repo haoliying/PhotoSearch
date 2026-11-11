@@ -69,7 +69,9 @@ data class SearchCondition(
     val concept: Concept? = null,               // 规范概念：检索的主依据
     val negated: Boolean = false,
     val minConfidence: Float = 0.3f,
-    val weight: Float = 1.0f
+    val weight: Float = 1.0f,
+    /** v3.11.0：同义 / 上下位词扩展，仅在原词与概念都未命中时兜底使用。 */
+    val expandedKeywords: List<String> = emptyList()
 )
 
 enum class ConditionType {

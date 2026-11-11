@@ -265,6 +265,14 @@ class AnalysisResultStore(context: Context) {
                 m.vlmKeywords.forEach { put(it) }
             })
 
+            // v3.11.0 本地增强信号
+            put("ocrText", m.ocrText)
+            put("brightness", m.brightness.toDouble())
+            put("saturation", m.saturation.toDouble())
+            put("faceCount", m.faceCount)
+            put("sceneTags", JSONArray().apply { m.sceneTags.forEach { put(it) } })
+            put("localTags", JSONArray().apply { m.localTags.forEach { put(it) } })
+
             put("labels", JSONArray().apply {
                 m.labels.forEach { l ->
                     put(JSONObject().apply {
@@ -361,6 +369,17 @@ class AnalysisResultStore(context: Context) {
             }
         }
 
+        // v3.11.0：旧缓存没有这些字段，一律走 opt* 默认值，无需重跑分析
+        fun optStringArray(key: String): List<String> {
+            val arr = json.optJSONArray(key) ?: return emptyList()
+            val list = ArrayList<String>(arr.length())
+            for (i in 0 until arr.length()) {
+                val s = arr.optString(i, "").trim()
+                if (s.isNotEmpty()) list.add(s)
+            }
+            return list
+        }
+
         return PhotoMetadata(
             photoId = json.optLong("photoId", 0),
             labels = labels,
@@ -374,7 +393,13 @@ class AnalysisResultStore(context: Context) {
             height = json.optInt("height", 0),
             isAnalyzed = json.optBoolean("isAnalyzed", true),
             description = json.optString("description", ""),
-            vlmKeywords = vlmKeywords
+            vlmKeywords = vlmKeywords,
+            ocrText = json.optString("ocrText", ""),
+            brightness = json.optDouble("brightness", -1.0).toFloat(),
+            saturation = json.optDouble("saturation", -1.0).toFloat(),
+            faceCount = json.optInt("faceCount", 0),
+            sceneTags = optStringArray("sceneTags"),
+            localTags = optStringArray("localTags")
         )
     }
 }

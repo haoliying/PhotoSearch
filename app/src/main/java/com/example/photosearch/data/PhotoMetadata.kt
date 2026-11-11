@@ -28,7 +28,20 @@ data class PhotoMetadata(
     // VLM-generated rich description (Chinese)
     val description: String = "",
     // VLM-generated structured keywords
-    val vlmKeywords: List<String> = emptyList()
+    val vlmKeywords: List<String> = emptyList(),
+    // ---- v3.11.0 本地增强信号（全部带默认值，历史缓存反序列化自动兼容）----
+    /** 端侧文字识别结果（若有）；纯本地，不联网。 */
+    val ocrText: String = "",
+    /** 平均亮度 0..1；-1 表示旧缓存未采集，由 dominantColors 兜底估算。 */
+    val brightness: Float = -1f,
+    /** 平均饱和度 0..1；-1 表示旧缓存未采集。 */
+    val saturation: Float = -1f,
+    /** 人脸数量（显式记录，避免 faces 列表被裁剪后丢失人数）。 */
+    val faceCount: Int = 0,
+    /** 多场景中文标签：旧版只保留一个 sceneType，这里补全所有得分达标的场景。 */
+    val sceneTags: List<String> = emptyList(),
+    /** 分析时生成的其它本地中文标签（供检索与界面展示）。 */
+    val localTags: List<String> = emptyList()
 )
 
 data class DetectedObject(
@@ -91,6 +104,11 @@ fun PhotoMetadata.toSearchableTags(): Set<String> {
 
     // VLM structured keywords
     vlmKeywords.forEach { tags.add(it.lowercase()) }
+
+    // v3.11.0：本地增强标签与 OCR 文本（不依赖大模型）
+    localTags.forEach { tags.add(it.lowercase()) }
+    sceneTags.forEach { tags.add(it.lowercase()) }
+    if (ocrText.isNotBlank()) tags.add(ocrText.lowercase().take(800))
 
     // Add all labels (both English and common Chinese translations)
     labels.forEach { label ->
@@ -166,6 +184,9 @@ fun PhotoMetadata.toSearchableTags(): Set<String> {
 fun PhotoMetadata.chineseDisplayTags(limit: Int = Int.MAX_VALUE): List<String> {
     val out = mutableListOf<String>()
     vlmKeywords.forEach { LabelTranslator.toChinese(it)?.let { t -> out += t } }
+    // v3.11.0：不依赖大模型的本地增强标签（夜景 / 竖幅 / 合影 / 文字 …）
+    localTags.forEach { LabelTranslator.toChinese(it)?.let { t -> out += t } }
+    sceneTags.forEach { LabelTranslator.toChinese(it)?.let { t -> out += t } }
     labels.sortedByDescending { it.confidence }.forEach {
         LabelTranslator.toChinese(it.text)?.let { t -> out += t }
     }

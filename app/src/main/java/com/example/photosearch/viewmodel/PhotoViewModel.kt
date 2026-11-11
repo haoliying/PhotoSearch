@@ -81,7 +81,13 @@ data class PhotoSearchState(
     /** 本次守护期间自动分析完成的张数。 */
     val autoAnalyzedCount: Int = 0,
     /** 相册变化后正在增量刷新列表，避免重复触发。 */
-    val isAlbumRefreshing: Boolean = false
+    val isAlbumRefreshing: Boolean = false,
+    // v3.11.0 大模型使用策略 + 不依赖大模型的本地准确度增强
+    val vlmModeId: String = "all",
+    val vlmSummary: String = "",
+    val localEnhanceEnabled: Boolean = true,
+    val vlmSelectedCount: Int = 0,
+    val vlmUncertainThreshold: Float = 0.55f
 )
 
 /** computeFilters 的产物，主线程一次性写入 StateFlow。 */
@@ -181,7 +187,12 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                     doneCount = plan.doneCount,
                     pendingCount = plan.pendingCount,
                     autoResumeEnabled = AppConfig.isAutoResumeEnabled(getApplication()),
-                    backgroundWatchEnabled = AppConfig.isBackgroundWatchEnabled(getApplication())
+                    backgroundWatchEnabled = AppConfig.isBackgroundWatchEnabled(getApplication()),
+                    vlmModeId = AppConfig.getVlmModeId(getApplication()),
+                    localEnhanceEnabled = AppConfig.isLocalEnhanceEnabled(getApplication()),
+                    vlmSelectedCount = AppConfig.getVlmSelectedIds(getApplication()).size,
+                    vlmUncertainThreshold = AppConfig.getUncertainThreshold(getApplication()),
+                    vlmSummary = vlmSummaryOf()
                 )
                 scheduleFilters(0)
                 extractExif(photos)
@@ -358,7 +369,9 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                 metadataMap = metadataCache,
                 exifMap = st.exifMap,
                 cache = docCache,
-                isActive = { gen == filterGeneration && isActive() }
+                isActive = { gen == filterGeneration && isActive() },
+                // v3.11.0：设置页可关闭本地增强，关闭后检索行为与 v3.10.0 完全一致
+                localEnhance = st.localEnhanceEnabled
             )
         } catch (_: SearchEngine.SearchCancelledException) {
             return null
@@ -396,12 +409,47 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** v3.9.0：用纯逻辑计划器算「已完成 / 待分析」，UI 与 Service 口径完全一致。 */
+    /** v3.9.0：用纯逻辑计划器算「已完成 / 待分析」，UI 与 Service 口径完全一致。
+     *  v3.11.0：改为使用同一份「大模型使用策略」快照，避免 UI 与后台守护口径不一致。 */
     private fun computePlan(photos: List<PhotoItem>): AnalysisPlanner.Plan {
-        val app = getApplication<Application>()
-        val useVlm = AppConfig.isVlmEnabled(app) && AppConfig.hasApiKey(app)
-        return AnalysisPlanner.plan(photos.map { it.id }, metadataCache, useVlm)
+        val config = readVlmConfig()
+        return AnalysisPlanner.plan(
+            photos.map { it.id }, metadataCache,
+            AnalysisPlanner.VlmPlanPolicy(
+                enabled = config.enabled,
+                modeId = config.mode.id,
+                selectedIds = config.selectedIds,
+                uncertainThreshold = config.uncertainThreshold
+            )
+        )
     }
+
+    /** v3.11.0：读取一次策略快照，供 UI 计划、单张/批量重分析复用。 */
+    private fun readVlmConfig(): VlmPolicyConfig {
+        val app = getApplication<Application>()
+        return VlmPolicyConfig(
+            mode = VlmMode.fromId(AppConfig.getVlmModeId(app)),
+            uncertainThreshold = AppConfig.getUncertainThreshold(app),
+            selectedIds = AppConfig.getVlmSelectedIds(app),
+            apiKeyPresent = AppConfig.hasApiKey(app),
+            wifiOnly = AppConfig.isVlmWifiOnly(app),
+            wifiAvailable = isWifiAvailable()
+        )
+    }
+
+    private fun isWifiAvailable(): Boolean {
+        return try {
+            val cm = getApplication<Application>()
+                .getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+                    as? android.net.ConnectivityManager ?: return true
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork ?: return false) ?: return false
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+        } catch (e: Exception) {
+            true
+        }
+    }
+
+    private fun vlmSummaryOf(): String = VlmPolicy.summary(readVlmConfig())
 
     // ------------------------------------------------------------------
     // 对 UI 暴露的筛选 API
@@ -691,6 +739,60 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * v3.11.0：设置页保存「大模型使用策略 / 本地增强开关」后调用。
+     * 文档缓存内容随开关变化，必须整体失效；后台守护按新策略立即重新对账。
+     */
+    fun onVlmConfigChanged() {
+        val app = getApplication<Application>()
+        _state.value = _state.value.copy(
+            vlmModeId = AppConfig.getVlmModeId(app),
+            localEnhanceEnabled = AppConfig.isLocalEnhanceEnabled(app),
+            vlmSelectedCount = AppConfig.getVlmSelectedIds(app).size,
+            vlmUncertainThreshold = AppConfig.getUncertainThreshold(app),
+            vlmSummary = vlmSummaryOf()
+        )
+        docCache.clear()
+        val plan = computePlan(_state.value.allPhotos)
+        _state.value = _state.value.copy(
+            doneCount = plan.doneCount,
+            pendingCount = plan.pendingCount,
+            canResume = plan.resumed
+        )
+        scheduleFilters(0)
+        if (AnalysisService.isWatchActive()) AnalysisService.requestScan(app)
+    }
+
+    /**
+     * v3.11.0：把多选的照片明确交给大模型精修。
+     * 这是「选择让大模型分析的照片」的主入口：写入持久化待办集合后，
+     * 任何非 OFF 策略下都会被计划器强制纳入队列，分析完自动消费。
+     */
+    fun analyzeSelectedWithVlm() {
+        val ids = _state.value.selectedIds.toList()
+        if (ids.isEmpty()) return
+        val app = getApplication<Application>()
+        if (AppConfig.getVlmModeId(app) == VlmMode.OFF.id) {
+            _state.value = _state.value.copy(
+                error = "当前为「不使用大模型」，请先在设置里选择一种大模型使用策略"
+            )
+            return
+        }
+        if (!AppConfig.hasApiKey(app)) {
+            _state.value = _state.value.copy(error = "请先在设置里配置 API Key")
+            return
+        }
+        AppConfig.addVlmSelectedIds(app, ids)
+        exitSelectionMode()
+        _state.value = _state.value.copy(
+            error = null,
+            vlmSelectedCount = AppConfig.getVlmSelectedIds(app).size,
+            vlmSummary = vlmSummaryOf()
+        )
+        if (AnalysisService.isWatchActive()) AnalysisService.requestScan(app)
+        else AnalysisService.requestWatch(app)
+    }
+
     /** 清空结果全量重跑：磁盘由 Service 单点清理，避免两侧同时 clear 竞态。 */
     fun restartAnalysis() {
         viewModelScope.launch {
@@ -722,7 +824,8 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
             _state.value = _state.value.copy(reanalyzingPhoto = true, reanalyzeError = null)
             try {
                 val context = getApplication<Application>()
-                val useVlm = AppConfig.isVlmEnabled(context) && AppConfig.hasApiKey(context)
+                // v3.11.0：单张重分析同样遵守「大模型使用策略」
+                val vlmConfig = readVlmConfig()
 
                 val analyzer = EnhancedImageAnalyzer(context)
                 val onDeviceMetadata = withContext(Dispatchers.IO) {
@@ -732,7 +835,13 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
 
                 var description = ""
                 var vlmKeywords = listOf<String>()
-                if (useVlm) {
+                val decision = VlmPolicy.decide(
+                    vlmConfig, photo.id,
+                    isNew = false,
+                    hasDescription = false,
+                    confidence = VlmPolicy.localConfidence(onDeviceMetadata)
+                )
+                if (decision.useVlm) {
                     try {
                         val vlmAnalyzer = VisionLanguageAnalyzer(context)
                         val vlmResult = vlmAnalyzer.analyzePhoto(photo.uri)
@@ -745,6 +854,7 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                     } catch (e: Exception) {
                         _state.value = _state.value.copy(reanalyzeError = "VLM 分析异常: ${e.message}")
                     }
+                    AppConfig.removeVlmSelectedIds(context, listOf(photo.id))
                 }
 
                 val metadata = onDeviceMetadata.copy(
@@ -865,9 +975,10 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                 batchReanalyzing = true, batchProgress = 0, batchTotal = ids.size
             )
             val context = getApplication<Application>()
-            val useVlm = AppConfig.isVlmEnabled(context) && AppConfig.hasApiKey(context)
+            // v3.11.0：批量重分析也遵守「大模型使用策略」，逐张判定
+            val vlmConfig = readVlmConfig()
             val analyzer = EnhancedImageAnalyzer(context)
-            val vlmAnalyzer = if (useVlm) VisionLanguageAnalyzer(context) else null
+            val vlmAnalyzer = if (vlmConfig.enabled) VisionLanguageAnalyzer(context) else null
             // v3.8.0：批量过程中不再每张复制整个照片列表，结束时合并一次
             val updatedById = HashMap<Long, PhotoItem>(ids.size)
 
@@ -881,7 +992,13 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         var description = ""
                         var vlmKeywords = listOf<String>()
-                        if (vlmAnalyzer != null) {
+                        val decision = VlmPolicy.decide(
+                            vlmConfig, photo.id,
+                            isNew = false,
+                            hasDescription = false,
+                            confidence = VlmPolicy.localConfidence(onDeviceMetadata)
+                        )
+                        if (decision.useVlm && vlmAnalyzer != null) {
                             try {
                                 val vlmResult = vlmAnalyzer.analyzePhoto(photo.uri)
                                 if (vlmResult.success) {
@@ -889,6 +1006,7 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                                     vlmKeywords = vlmResult.keywords
                                 }
                             } catch (_: Exception) { }
+                            AppConfig.removeVlmSelectedIds(context, listOf(photo.id))
                         }
                         val metadata = onDeviceMetadata.copy(
                             photoId = photo.id, description = description, vlmKeywords = vlmKeywords

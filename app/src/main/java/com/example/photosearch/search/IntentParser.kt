@@ -48,9 +48,16 @@ object IntentParser {
         for (part in parts) {
             val terms = ConceptRegistry.tokenizeQuery(part)
             val concepts = ConceptRegistry.normalize(part)
+            // v3.11.0：只对「已归一到规范概念」的条件启用同义词扩展。
+            // 词表外自由词（咖啡、笔记本电脑等）不扩展，避免把同类但不同的
+            // 物体（茶 ↔ 咖啡、篮球 ↔ 跑步）混在一起造成误召。
+            val expanded = if (concepts.isNotEmpty()) QueryExpander.expandAll(terms) else emptyList()
             if (concepts.isNotEmpty()) {
                 concepts.forEach { c ->
-                    conditions += SearchCondition(type = typeFor(c), concept = c, keywords = terms)
+                    conditions += SearchCondition(
+                        type = typeFor(c), concept = c, keywords = terms,
+                        expandedKeywords = expanded
+                    )
                 }
             } else if (terms.isNotEmpty()) {
                 conditions += SearchCondition(type = ConditionType.COMPOSITE, keywords = terms)

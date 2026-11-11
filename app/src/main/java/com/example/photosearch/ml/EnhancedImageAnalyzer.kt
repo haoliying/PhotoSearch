@@ -95,10 +95,15 @@ class EnhancedImageAnalyzer(context: Context) {
                 @Suppress("UNCHECKED_CAST")
                 val faceList = faces as List<FaceInfo>
                 @Suppress("UNCHECKED_CAST")
-                val colorList = colors as List<Int>
+                val colorStats = colors as VisualStats
 
-                val sceneType = classifyScene(labelList, objectList)
+                // v3.11.0：保留全部达标场景，而不是只留一个 sceneType
+                val sceneScores = scoreScenes(labelList, objectList)
+                val sceneType = sceneScores.maxByOrNull { it.value }?.key ?: SceneType.UNKNOWN
+                val sceneTags = multiSceneTags(sceneScores)
                 val isOutdoor = inferOutdoor(labelList, sceneType)
+                val width = bitmap.width
+                val height = bitmap.height
 
                 if (!bitmap.isRecycled) bitmap.recycle()
 
@@ -108,12 +113,17 @@ class EnhancedImageAnalyzer(context: Context) {
                     detectedObjects = objectList,
                     faces = faceList,
                     sceneType = sceneType,
-                    dominantColors = colorList,
+                    dominantColors = colorStats.colors,
                     isOutdoor = isOutdoor,
                     hasText = labelList.any { it.text.lowercase() in listOf("text", "document", "book", "sign", "writing", "lettering") },
-                    width = bitmap.width,
-                    height = bitmap.height,
-                    isAnalyzed = true
+                    width = width,
+                    height = height,
+                    isAnalyzed = true,
+                    // v3.11.0 本地增强信号（纯端侧，不联网）
+                    brightness = colorStats.brightness,
+                    saturation = colorStats.saturation,
+                    faceCount = faceList.size,
+                    sceneTags = sceneTags
                 )
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -256,38 +266,64 @@ class EnhancedImageAnalyzer(context: Context) {
     }
 
     // --- Color Analysis ---
-    private fun analyzeColors(bitmap: Bitmap): List<Int> {
+    /** v3.11.0：主色 + 平均亮度 + 平均饱和度，一次采样全部算出，供本地检索增强使用。 */
+    private data class VisualStats(
+        val colors: List<Int>,
+        val brightness: Float,
+        val saturation: Float
+    )
+
+    private fun analyzeColors(bitmap: Bitmap): VisualStats {
         try {
             val colorCounts = mutableMapOf<Int, Int>()
             val step = maxOf(1, (bitmap.width * bitmap.height) / 500) // Sample ~500 pixels
+            var sumBrightness = 0f
+            var sumSaturation = 0f
+            var samples = 0
 
             for (i in 0 until bitmap.width * bitmap.height step step) {
                 val x = i % bitmap.width
                 val y = i / bitmap.width
                 if (y >= bitmap.height) break
                 val pixel = bitmap.getPixel(x, y)
+                val rawR = AndroidColor.red(pixel)
+                val rawG = AndroidColor.green(pixel)
+                val rawB = AndroidColor.blue(pixel)
                 // Quantize color to reduce palette
-                val r = (AndroidColor.red(pixel) / 32) * 32
-                val g = (AndroidColor.green(pixel) / 32) * 32
-                val b = (AndroidColor.blue(pixel) / 32) * 32
+                val r = (rawR / 32) * 32
+                val g = (rawG / 32) * 32
+                val b = (rawB / 32) * 32
                 val quantized = AndroidColor.rgb(r, g, b)
                 colorCounts[quantized] = (colorCounts[quantized] ?: 0) + 1
+
+                sumBrightness += (0.299f * rawR + 0.587f * rawG + 0.114f * rawB) / 255f
+                val mx = maxOf(rawR, rawG, rawB).coerceAtLeast(1)
+                val mn = minOf(rawR, rawG, rawB)
+                sumSaturation += (mx - mn).toFloat() / mx
+                samples++
             }
 
-            return colorCounts.entries
+            val top = colorCounts.entries
                 .sortedByDescending { it.value }
                 .take(5)
                 .map { it.key }
+            if (samples == 0) return VisualStats(top, -1f, -1f)
+            return VisualStats(top, sumBrightness / samples, sumSaturation / samples)
         } catch (e: Exception) {
-            return emptyList()
+            return VisualStats(emptyList(), -1f, -1f)
         }
     }
 
     // --- Scene Classification ---
-    private fun classifyScene(
+    /**
+     * v3.11.0：返回**所有**场景的得分，而不是只留得分最高的一个。
+     * 一张「夜晚 + 城市 + 车」的照片在旧版只会留下一个标签，另外两个概念
+     * 全部丢失 —— 这是不用大模型时召回不足的重要原因之一。
+     */
+    private fun scoreScenes(
         labels: List<PhotoLabel>,
         objects: List<com.example.photosearch.data.DetectedObject>
-    ): SceneType {
+    ): Map<SceneType, Float> {
         val labelTexts = labels.map { it.text.lowercase() }.toSet()
         val objectTexts = objects.map { it.label.lowercase() }.toSet()
         val allTexts = labelTexts + objectTexts
@@ -360,8 +396,37 @@ class EnhancedImageAnalyzer(context: Context) {
             addScore(SceneType.LANDSCAPE, 2f)
         }
 
-        // Return highest scoring scene
-        return scores.maxByOrNull { it.value }?.key ?: SceneType.UNKNOWN
+        return scores
+    }
+
+    /** 兼容旧调用名：取得分最高的场景。 */
+    private fun classifyScene(
+        labels: List<PhotoLabel>,
+        objects: List<com.example.photosearch.data.DetectedObject>
+    ): SceneType = scoreScenes(labels, objects).maxByOrNull { it.value }?.key ?: SceneType.UNKNOWN
+
+    /** 把所有达标场景翻成中文可检索标签（多场景，不再是单一 sceneType）。 */
+    private fun multiSceneTags(scores: Map<SceneType, Float>): List<String> {
+        val tags = LinkedHashSet<String>()
+        scores.filterValues { it >= 2f }.keys.forEach { scene ->
+            when (scene) {
+                SceneType.BEACH_SEA -> tags.addAll(listOf("海滩", "海边", "沙滩", "海景"))
+                SceneType.MOUNTAIN_HILL -> tags.addAll(listOf("山景", "登山", "爬山"))
+                SceneType.VEHICLE_SCENE -> tags.addAll(listOf("车辆", "汽车", "交通工具"))
+                SceneType.FOOD_DRINK -> tags.addAll(listOf("美食", "食物", "餐饮"))
+                SceneType.ANIMAL_PET -> tags.addAll(listOf("动物", "宠物"))
+                SceneType.SPORT_EXERCISE -> tags.addAll(listOf("运动", "健身"))
+                SceneType.NIGHT_SCENE -> tags.addAll(listOf("夜景", "夜晚"))
+                SceneType.OUTDOOR_NATURE -> tags.addAll(listOf("户外", "自然", "风景"))
+                SceneType.OUTDOOR_URBAN -> tags.addAll(listOf("城市", "街道", "建筑"))
+                SceneType.PEOPLE_PORTRAIT -> tags.addAll(listOf("人物", "人像"))
+                SceneType.LANDSCAPE -> tags.addAll(listOf("风景", "景色"))
+                SceneType.INDOOR_HOME, SceneType.INDOOR_PUBLIC, SceneType.INDOOR_EVENT ->
+                    tags.addAll(listOf("室内", "室内照"))
+                else -> Unit
+            }
+        }
+        return tags.toList()
     }
 
     private fun inferOutdoor(labels: List<PhotoLabel>, scene: SceneType): Boolean? {

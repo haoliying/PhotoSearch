@@ -396,8 +396,12 @@ object ConceptRegistry {
         val index: SearchIndex
     )
 
-    fun prepare(m: PhotoMetadata, exif: PhotoExif? = null): PreparedDoc =
-        PreparedDoc(fromMetadata(m), buildSearchIndex(m, exif))
+    /**
+     * v3.11.0：localEnhance 控制是否把不依赖大模型的本地视觉标签编入索引。
+     * 关闭后行为与 v3.10.0 完全一致，供设置页开关与离线评测使用。
+     */
+    fun prepare(m: PhotoMetadata, exif: PhotoExif? = null, localEnhance: Boolean = true): PreparedDoc =
+        PreparedDoc(fromMetadata(m), buildSearchIndex(m, exif, localEnhance))
 
     /**
      * v3.8.0 文档缓存：LRU，按 photoId 缓存 PreparedDoc。
@@ -415,8 +419,13 @@ object ConceptRegistry {
         }
 
         @Synchronized
-        fun get(photoId: Long, m: PhotoMetadata, exif: PhotoExif?): PreparedDoc =
-            map[photoId] ?: prepare(m, exif).also { map[photoId] = it }
+        fun get(
+            photoId: Long,
+            m: PhotoMetadata,
+            exif: PhotoExif?,
+            localEnhance: Boolean = true
+        ): PreparedDoc =
+            map[photoId] ?: prepare(m, exif, localEnhance).also { map[photoId] = it }
 
         @Synchronized
         fun invalidate(ids: Collection<Long>) {
@@ -439,7 +448,11 @@ object ConceptRegistry {
      * v3.6.0：可选传入 EXIF，把地点名称与拍摄年/月也纳入全文通道，
      * 这样即使自然语言里没被解析成结构化筛选，输入「北京」「2023」也能命中。
      */
-    fun buildSearchIndex(m: PhotoMetadata, exif: PhotoExif? = null): SearchIndex {
+    fun buildSearchIndex(
+        m: PhotoMetadata,
+        exif: PhotoExif? = null,
+        localEnhance: Boolean = true
+    ): SearchIndex {
         // v3.8.0：同权重文本合并，桶按权重降序，命中即返回最大权重
         val buckets = mutableMapOf<Float, StringBuilder>()
         fun add(text: String, weight: Float) {
@@ -513,6 +526,14 @@ object ConceptRegistry {
             // v3.7.0：相机 / 镜头 / 曝光 / 画幅 / 格式 / 季节 / 时段等中文标签
             exif.searchableExifTags().forEach { add(it, 0.75f) }
         }
+
+        // ---- v3.11.0：不依赖大模型的本地准确度增强 ----
+        // 纯函数，从已落盘的结构化字段推导；升级后历史分析结果无需重跑即可生效。
+        // 包括：主色 / 明暗 / 构图 / 人数 / 文字 / 多场景 / 低置信标签 / OCR 文本。
+        if (localEnhance) {
+            LocalVisualTags.build(m, exif).forEach { add(it.tag, it.weight) }
+        }
+
         val ordered = buckets.entries
             .sortedByDescending { it.key }
             .map { it.key to it.value.toString() }

@@ -12,6 +12,8 @@
 
     <!-- Network access for VLM API calls -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- v3.11.0：「仅 Wi-Fi 下使用大模型」需要读取当前网络类型（普通权限，无需动态申请） -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!-- Foreground service permissions -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

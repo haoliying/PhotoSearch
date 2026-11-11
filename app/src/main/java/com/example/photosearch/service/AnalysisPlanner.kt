@@ -1,6 +1,9 @@
 package com.example.photosearch.service
 
 import com.example.photosearch.data.PhotoMetadata
+import com.example.photosearch.search.VlmMode
+import com.example.photosearch.search.VlmPolicy
+import com.example.photosearch.search.VlmPolicyConfig
 
 /**
  * v3.9.0：断点续分析的决策核心。纯 Kotlin、不依赖 Android，可离线评测。
@@ -14,16 +17,36 @@ import com.example.photosearch.data.PhotoMetadata
  *
  * 新实现只认 **photoId**：
  *   pending = 相册中的 id − 已成功落盘的 id
- * 另外，开启云端 AI 时，把「本地标签已有、但 AI 描述为空」的占位结果也纳入补齐队列，
- * 这样 VLM 限流 / 断网造成的半结果不必「重新分析全部」。
+ *
+ * v3.11.0：新增「大模型使用策略」。旧版只要开了云端 AI，就会把所有
+ * 「本地标签已有、但 AI 描述为空」的存量照片排进补描述队列 —— 用户无法挑选
+ * 哪些照片交给大模型。现在由 [VlmPlanPolicy] 决定：
+ *   OFF / ALL / NEW_ONLY / UNCERTAIN / SELECTED，且手动勾选的照片强制纳入。
  *
  * 不变量：
- *  1. 已落盘的 id 绝不出现在 pending 里（除非需要补 AI 描述）；
- *  2. 相册新增照片自动进入 pending，已分析照片绝不重跑；
+ *  1. 已落盘的 id 绝不出现在 pending 里（除非策略要求补 AI 描述）；
+ *  2. 相册新增照片自动进入 pending，已分析照片绝不重复做本地分析；
  *  3. 照片从相册删除不影响其他 id 的计划；
  *  4. pending 为空 <=> complete，doneCount + pendingCount == totalCount。
  */
 object AnalysisPlanner {
+
+    /** v3.11.0：一次对账使用的大模型策略快照（纯数据，便于评测）。 */
+    data class VlmPlanPolicy(
+        /** 大模型通道是否可用（策略非 OFF + 有 API Key + 网络条件满足）。 */
+        val enabled: Boolean = false,
+        val modeId: String = VlmMode.OFF.id,
+        val selectedIds: Set<Long> = emptySet(),
+        val uncertainThreshold: Float = 0.55f
+    ) {
+        companion object {
+            /** 兼容旧调用：true = 全部照片都补 AI 描述，false = 完全不补。 */
+            fun legacy(enabled: Boolean): VlmPlanPolicy = VlmPlanPolicy(
+                enabled = enabled,
+                modeId = if (enabled) VlmMode.ALL.id else VlmMode.OFF.id
+            )
+        }
+    }
 
     data class Plan(
         /** 本次需要分析 / 补齐的 photoId，顺序与相册一致。 */
@@ -42,14 +65,22 @@ object AnalysisPlanner {
     }
 
     /**
-     * @param photoIds 当前相册的 photoId 列表（可能有重复，内部去重）
-     * @param analyzed 持久化缓存中已落盘的结果（key 为 photoId）
-     * @param vlmEnabled 本次分析是否真的会调用云端 AI（开关 + 有 Key）
+     * 兼容 v3.10.0 及以前的调用点与离线评测：布尔开关等价于「全部 / 不使用」。
      */
     fun plan(
         photoIds: List<Long>,
         analyzed: Map<Long, PhotoMetadata>,
         vlmEnabled: Boolean
+    ): Plan = plan(photoIds, analyzed, VlmPlanPolicy.legacy(vlmEnabled))
+
+    /**
+     * v3.11.0 主入口。
+     * @param policy 大模型使用策略；[VlmPlanPolicy.enabled] 为 false 时完全不补描述。
+     */
+    fun plan(
+        photoIds: List<Long>,
+        analyzed: Map<Long, PhotoMetadata>,
+        policy: VlmPlanPolicy
     ): Plan {
         // 去重且保序，避免同一张照片被排进队列两次
         val unique = LinkedHashSet<Long>(photoIds.size * 2)
@@ -58,13 +89,35 @@ object AnalysisPlanner {
         val doneIds = HashSet<Long>(analyzed.size * 2)
         analyzed.forEach { (id, m) -> if (m.isAnalyzed) doneIds.add(id) }
 
+        val config = VlmPolicyConfig(
+            mode = VlmMode.fromId(policy.modeId),
+            uncertainThreshold = policy.uncertainThreshold,
+            selectedIds = policy.selectedIds,
+            // 计划阶段只关心「策略是否允许」，Key / 网络由 enabled 统一表达
+            apiKeyPresent = true,
+            wifiOnly = false,
+            wifiAvailable = true
+        )
+
         val pending = ArrayList<Long>()
         var retryVlm = 0
         for (id in unique) {
             if (id !in doneIds) {
-                pending.add(id)                         // 从未分析过
-            } else if (vlmEnabled && analyzed[id]?.description.isNullOrBlank()) {
-                pending.add(id)                         // 只有本地标签，补 AI 描述
+                pending.add(id)                         // 从未分析过（首次或增量）
+                continue
+            }
+            // 已有本地结果：是否补云端大模型描述，完全交给策略决定
+            if (!policy.enabled) continue
+            val m = analyzed[id] ?: continue
+            val decision = VlmPolicy.decide(
+                config = config,
+                photoId = id,
+                isNew = false,
+                hasDescription = m.description.isNotBlank(),
+                confidence = VlmPolicy.localConfidence(m)
+            )
+            if (decision.useVlm) {
+                pending.add(id)
                 retryVlm++
             }
         }

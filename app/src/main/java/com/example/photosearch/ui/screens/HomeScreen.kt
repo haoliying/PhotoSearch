@@ -93,6 +93,9 @@ fun HomeScreen(
     onToggleSelection: (Long) -> Unit = {},
     onSelectAll: () -> Unit = {},
     onBatchReanalyze: () -> Unit = {},
+    // v3.11.0：把多选的照片明确交给大模型精修
+    vlmEnabled: Boolean = true,
+    onAnalyzeSelectedWithVlm: () -> Unit = {},
     // v3.6.0 时间 / 地点联动筛选
     timeRange: TimeRange? = null,
     locationQuery: LocationQuery? = null,
@@ -201,7 +204,7 @@ fun HomeScreen(
                                 )
                                 if (hasAnalyzed && photos.isNotEmpty()) {
                                     DropdownMenuItem(
-                                        text = { Text("多选照片重新分析") },
+                                        text = { Text("多选照片（重新分析 / 交给大模型）") },
                                         leadingIcon = { Icon(Icons.Default.Checklist, null) },
                                         onClick = { showOverflow = false; onEnterSelection() }
                                     )
@@ -244,19 +247,30 @@ fun HomeScreen(
         bottomBar = {
             if (selectionMode && selectedIds.isNotEmpty()) {
                 Surface(shadowElevation = 8.dp, color = Surface) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)
                     ) {
                         Text("已选 ${selectedIds.size} 张", style = MaterialTheme.typography.bodySmall,
                             color = OnSurface.copy(alpha = 0.6f))
-                        Button(
-                            onClick = onBatchReanalyze,
-                            enabled = !batchReanalyzing,
-                            colors = ButtonDefaults.buttonColors(containerColor = Primary),
-                            shape = RoundedCornerShape(8.dp)
-                        ) { Text("重新分析") }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = onBatchReanalyze,
+                                enabled = !batchReanalyzing,
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                                shape = RoundedCornerShape(8.dp)
+                            ) { Text("重新分析") }
+                            if (vlmEnabled) {
+                                Button(
+                                    onClick = onAnalyzeSelectedWithVlm,
+                                    enabled = !batchReanalyzing,
+                                    modifier = Modifier.weight(1f),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Secondary),
+                                    shape = RoundedCornerShape(8.dp)
+                                ) { Text("用大模型分析") }
+                            }
+                        }
                     }
                 }
             }

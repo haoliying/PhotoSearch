@@ -8,6 +8,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -16,6 +18,9 @@ import com.example.photosearch.MainActivity
 import com.example.photosearch.data.*
 import com.example.photosearch.ml.EnhancedImageAnalyzer
 import com.example.photosearch.ml.VisionLanguageAnalyzer
+import com.example.photosearch.search.VlmMode
+import com.example.photosearch.search.VlmPolicy
+import com.example.photosearch.search.VlmPolicyConfig
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -254,16 +259,17 @@ class AnalysisService : Service() {
             AnalysisEvents.emitWatch(AnalysisEvents.WatchState(active = true))
         }
 
-        val useVlm = AppConfig.isVlmEnabled(this@AnalysisService) &&
-                AppConfig.hasApiKey(this@AnalysisService)
         val metaFlushStep = AppConfig.getSegmentSize(this@AnalysisService).coerceIn(10, 200)
         val repository = PhotoRepository(this@AnalysisService)
 
         onDeviceAnalyzer = EnhancedImageAnalyzer(this@AnalysisService)
-        vlmAnalyzer = if (useVlm) VisionLanguageAnalyzer(this@AnalysisService) else null
+        // 是否真正联网由逐张策略决定；这里只创建客户端对象（构造不发起请求）
+        vlmAnalyzer = VisionLanguageAnalyzer(this@AnalysisService)
 
         try {
             var round = 0
+            /** 上一轮待处理集合：避免云端 AI 持续失败时在 while 里原地无限重试。 */
+            var lastPendingSignature: Set<Long> = emptySet()
             while (currentCoroutineContext().isActive) {
                 val photos = repository.loadAllPhotos()
                 val ids = photos.map { it.id }
@@ -278,6 +284,17 @@ class AnalysisService : Service() {
                 }
                 hasReconciledOnce = true
 
+                // v3.11.0：每轮重新读取策略，用户在设置页改策略 / 勾选照片后下一轮即生效，
+                // 且已消费的「手动选择」不会再被反复排进队列。
+                val vlmConfig = readVlmConfig()
+                val useVlm = vlmConfig.enabled
+                val planPolicy = AnalysisPlanner.VlmPlanPolicy(
+                    enabled = useVlm,
+                    modeId = vlmConfig.mode.id,
+                    selectedIds = vlmConfig.selectedIds,
+                    uncertainThreshold = vlmConfig.uncertainThreshold
+                )
+
                 val stored = resultStore.load()
                 val analyzed: Map<Long, PhotoMetadata> = stored?.metadataMap ?: emptyMap()
                 if (round == 0) {
@@ -285,7 +302,7 @@ class AnalysisService : Service() {
                     analyzedMetadata.putAll(analyzed)
                 }
 
-                val plan = AnalysisPlanner.plan(ids, analyzed, useVlm)
+                val plan = AnalysisPlanner.plan(ids, analyzed, planPolicy)
 
                 if (plan.complete) {
                     resultStore.markComplete(photos.size, analyzed.size)
@@ -298,10 +315,24 @@ class AnalysisService : Service() {
                     return
                 }
 
+                // 防死循环：上一轮已完整跑过同样一批、期间又没有新照片进来，
+                // 说明是「云端 AI 持续失败 / 手动选择已消费」等无法在本轮满足的情况，
+                // 退出循环交给相册变化或用户下次手动触发，避免反复消耗 API。
+                val signature = plan.pendingIds.toHashSet()
+                if (round > 0 && signature == lastPendingSignature && delta.added.isEmpty()) {
+                    Log.w(TAG, "同一批照片重复待处理，停止本轮对账循环")
+                    resultStore.markProgress(photos.size, plan.doneCount)
+                    emitIdle(photos.size, useVlm)
+                    completed = true
+                    if (!AppConfig.isBackgroundWatchEnabled(this@AnalysisService)) stopAfterOneShot()
+                    return
+                }
+                lastPendingSignature = signature
+
                 val byId = HashMap<Long, PhotoItem>(photos.size * 2)
                 photos.forEach { byId[it.id] = it }
 
-                runPlan(photos, byId, plan, useVlm, metaFlushStep,
+                runPlan(photos, byId, plan, vlmConfig, metaFlushStep,
                     autoTriggered = hasReconciledOnce && round > 0)
                 round++
                 // 继续 while：把分析期间新增的照片也纳入下一次对账
@@ -329,10 +360,11 @@ class AnalysisService : Service() {
         photos: List<PhotoItem>,
         byId: Map<Long, PhotoItem>,
         plan: AnalysisPlanner.Plan,
-        useVlm: Boolean,
+        vlmConfig: VlmPolicyConfig,
         metaFlushStep: Int,
         autoTriggered: Boolean
     ) {
+        val useVlm = vlmConfig.enabled
         var done = plan.doneCount
         var sinceFlush = 0
         var degradedNotified = false
@@ -367,7 +399,10 @@ class AnalysisService : Service() {
                     updateNotification("AI 频繁出错，本轮改用本地分析（下次自动补齐）", done, photos.size)
                 }
 
-                val metadata = analyzeOne(photo, useVlm, vlmErrorCount)
+                // 已有本地结果的照片只补云端描述，不重复跑 ML Kit；
+                // 这样「策略判定用的置信度」与计划器完全一致，避免反复排队。
+                val existing = analyzedMetadata[id]
+                val metadata = analyzeOne(photo, vlmConfig, existing, vlmErrorCount)
                 resultStore.appendResult(id, metadata)          // 单张落盘，O(1)，唯一权威
                 analyzedMetadata[id] = metadata
                 buffer += id to metadata
@@ -455,22 +490,44 @@ class AnalysisService : Service() {
         )
     }
 
-    /** 分析单张：本地标签必写，云端 AI 失败时写占位结果（下次开启 AI 自动补齐）。 */
+    /**
+     * v3.11.0：分析单张。
+     *  - 本地标签必写；已经有本地结果的照片直接复用，不重复跑 ML Kit；
+     *  - 是否调用云端大模型由 [VlmPolicy.decide] 按「使用策略」逐张决定；
+     *  - 手动勾选的照片在尝试过（无论成败）后即从待办集合消费，避免无限重跑；
+     *  - 云端 AI 失败时写占位结果，下次由计划器按策略自动补齐。
+     */
     private suspend fun analyzeOne(
         photo: PhotoItem,
-        useVlm: Boolean,
+        vlmConfig: VlmPolicyConfig,
+        existing: PhotoMetadata?,
         vlmErrorCount: AtomicInteger
     ): PhotoMetadata {
-        val onDevice = try {
-            onDeviceAnalyzer!!.analyzePhoto(photo.uri, applicationContext)
-        } catch (e: Exception) {
-            Log.e(TAG, "本地分析失败 [${photo.id}]", e)
-            PhotoMetadata(photoId = photo.id, isAnalyzed = true)
+        val isNew = existing == null || !existing.isAnalyzed
+        val onDevice = if (isNew) {
+            try {
+                onDeviceAnalyzer!!.analyzePhoto(photo.uri, applicationContext)
+            } catch (e: Exception) {
+                Log.e(TAG, "本地分析失败 [${photo.id}]", e)
+                PhotoMetadata(photoId = photo.id, isAnalyzed = true)
+            }
+        } else {
+            existing!!
         }
 
-        var description = ""
-        var vlmKeywords = emptyList<String>()
-        if (useVlm && !vlmDegraded) {
+        val confidence = VlmPolicy.localConfidence(onDevice)
+        val hasDescription = onDevice.description.isNotBlank()
+        val decision = VlmPolicy.decide(
+            config = vlmConfig,
+            photoId = photo.id,
+            isNew = isNew,
+            hasDescription = hasDescription,
+            confidence = confidence
+        )
+
+        var description = onDevice.description
+        var vlmKeywords = onDevice.vlmKeywords
+        if (decision.useVlm && !vlmDegraded) {
             try {
                 val vlmResult = vlmAnalyzer!!.analyzePhoto(photo.uri)
                 if (vlmResult.success) {
@@ -484,6 +541,10 @@ class AnalysisService : Service() {
                 vlmErrorCount.incrementAndGet()
                 Log.e(TAG, "AI异常 [${photo.id}]", e)
             }
+            // 手动选择是「一次性显式请求」，尝试过就消费，失败也不原地无限重试
+            if (photo.id in vlmConfig.selectedIds) {
+                AppConfig.removeVlmSelectedIds(this, listOf(photo.id))
+            }
             if (vlmErrorCount.get() >= 20) {
                 vlmDegraded = true
                 Log.w(TAG, "AI 连续失败 20 次，本轮降级为本地分析")
@@ -495,6 +556,29 @@ class AnalysisService : Service() {
             description = description,
             vlmKeywords = vlmKeywords
         )
+    }
+
+    /** v3.11.0：从配置读取一次策略快照（含网络条件判断）。 */
+    private fun readVlmConfig(): VlmPolicyConfig = VlmPolicyConfig(
+        mode = VlmMode.fromId(AppConfig.getVlmModeId(this)),
+        uncertainThreshold = AppConfig.getUncertainThreshold(this),
+        selectedIds = AppConfig.getVlmSelectedIds(this),
+        apiKeyPresent = AppConfig.hasApiKey(this),
+        wifiOnly = AppConfig.isVlmWifiOnly(this),
+        wifiAvailable = isWifiAvailable()
+    )
+
+    /** 「仅 Wi-Fi 下使用大模型」的网络判断；无权限 / 判断失败时按可用处理。 */
+    private fun isWifiAvailable(): Boolean {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return true
+            val network = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(network) ?: return false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+        } catch (e: Exception) {
+            true
+        }
     }
 
     private fun emitProgress(

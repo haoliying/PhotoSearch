@@ -23,6 +23,10 @@ object SearchEngine {
     private val STRICT_ASCII = Regex("^[a-z0-9 -]+$")
     private const val MIN_EVIDENCE = 0.5f       // 概念证据强度下限
     private const val TEXT_MIN_EVIDENCE = 0.55f // 全文通道证据强度下限
+    /** v3.11.0：查询扩展词要求更强的证据，避免同义词兜底引入误召。 */
+    private const val EXPAND_MIN_EVIDENCE = 0.62f
+    /** 扩展命中分折扣：排序低于原词直接命中。 */
+    private const val EXPAND_SCORE_FACTOR = 0.85f
     private const val RANK_THRESHOLD = 0.45f    // RANK 模式平均分下限
     private const val RANK_MIN_CONDITION = 0.2f
     private const val FILTER_ONLY_SCORE = 0.6f  // 纯筛选结果的固定分
@@ -54,7 +58,9 @@ object SearchEngine {
         metadataMap: Map<Long, PhotoMetadata>,
         exifMap: Map<Long, PhotoExif> = emptyMap(),
         cache: ConceptRegistry.SearchDocCache? = null,
-        isActive: () -> Boolean = { true }
+        isActive: () -> Boolean = { true },
+        /** v3.11.0：是否启用不依赖大模型的本地准确度增强。 */
+        localEnhance: Boolean = true
     ): List<SearchResult> {
         if (intent.conditions.isEmpty() && !intent.hasFilters) return emptyList()
 
@@ -92,13 +98,13 @@ object SearchEngine {
                 isAnalyzed = false
             )
             // v3.8.0：优先复用缓存，未命中才现算；缓存未启用时行为与旧版一致
-            val doc = cache?.get(photo.id, metadata, exif)
-                ?: ConceptRegistry.prepare(metadata, exif)
+            val doc = cache?.get(photo.id, metadata, exif, localEnhance)
+                ?: ConceptRegistry.prepare(metadata, exif, localEnhance)
             val evidence = doc.evidence
             val docIndex = doc.index
 
             val evals = intent.conditions.map { cond ->
-                val (hit, score, source) = evaluateCondition(cond, metadata, evidence, docIndex)
+                val (hit, score, source) = evaluateCondition(cond, metadata, evidence, docIndex, localEnhance)
                 ConditionEval(
                     condition = cond,
                     hit = hit,
@@ -162,7 +168,8 @@ object SearchEngine {
         condition: SearchCondition,
         metadata: PhotoMetadata,
         evidence: Map<Concept, Float>,
-        index: ConceptRegistry.SearchIndex
+        index: ConceptRegistry.SearchIndex,
+        localEnhance: Boolean
     ): Triple<Boolean, Float, String> {
         // 通道 1：规范概念（精确率最高）
         val concept = condition.concept
@@ -180,10 +187,39 @@ object SearchEngine {
         }
 
         // 通道 2：全文检索（召回词表外的词，含 EXIF 地名/年份）。
+        // 原词路径与 v3.10.0 完全一致：按长度降序，第一个达到阈值的即返回。
         val terms = condition.keywords.distinct().sortedByDescending { it.length }
+        val weakHits = ArrayList<Float>()
         for (term in terms) {
             val s = index.score(term)
+            if (s > 0f) weakHits += s
             if (s >= TEXT_MIN_EVIDENCE) return Triple(true, s, "text:$term")
+        }
+
+        // ---- v3.11.0 新增通路（只在不启用增强时跳过，旧行为完全保留）----
+        if (localEnhance) {
+            // 2a. 多弱证据叠加：远景小车常只留下几条 0.44~0.50 的弱标签，
+            //     单条不够阈值，但多条相关证据合起来足以确信。
+            //     次证据按递减系数小权重累加，且要求至少两条，避免单条弱证据误召。
+            if (weakHits.size >= 2) {
+                val sorted = weakHits.sortedDescending()
+                var agg = sorted[0]
+                for (i in 1 until minOf(sorted.size, 5)) {
+                    agg += sorted[i] * (0.30f - (i - 1) * 0.06f)
+                }
+                if (agg >= TEXT_MIN_EVIDENCE) {
+                    return Triple(true, agg.coerceAtMost(1f), "text:multi(${weakHits.size})")
+                }
+            }
+
+            // 2b. 同义词 / 上下位词扩展兜底：照片标签是「车辆」，用户搜「汽车」。
+            //     只用于已归一到规范概念的条件，要求更强证据，命中分打折。
+            for (term in condition.expandedKeywords) {
+                val s = index.score(term)
+                if (s >= EXPAND_MIN_EVIDENCE) {
+                    return Triple(true, s * EXPAND_SCORE_FACTOR, "expand:$term")
+                }
+            }
         }
         return Triple(false, 0f, "")
     }

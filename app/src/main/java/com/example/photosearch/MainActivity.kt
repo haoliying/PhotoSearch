@@ -95,7 +95,8 @@ class MainActivity : ComponentActivity() {
                                     onBack = { showSettings = false },
                                     onOpenAbout = { showSettings = false; showAbout = true },
                                     onOpenHelp = { showSettings = false; showHelp = true },
-                                    onBackgroundWatchChanged = { viewModel.setBackgroundWatch(it) }
+                                    onBackgroundWatchChanged = { viewModel.setBackgroundWatch(it) },
+                                    onVlmConfigChanged = { viewModel.onVlmConfigChanged() }
                                 )
                             }
                         }
@@ -151,6 +152,8 @@ class MainActivity : ComponentActivity() {
                                 onToggleSelection = { viewModel.togglePhotoSelection(it) },
                                 onSelectAll = { viewModel.selectAllFiltered() },
                                 onBatchReanalyze = { viewModel.reanalyzeSelectedPhotos() },
+                                vlmEnabled = state.vlmModeId != "off",
+                                onAnalyzeSelectedWithVlm = { viewModel.analyzeSelectedWithVlm() },
                                 // v3.6.0 时间 / 地点联动筛选
                                 timeRange = state.timeRange,
                                 locationQuery = state.locationQuery,
