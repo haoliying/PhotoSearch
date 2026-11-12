@@ -44,7 +44,9 @@ object AnalysisEvents {
         /** 本次守护期间自动分析完成的新照片数。 */
         val autoAnalyzed: Int = 0,
         /** 当前是否正在跑分析循环。 */
-        val analyzing: Boolean = false
+        val analyzing: Boolean = false,
+        /** v3.11.2：用户显式暂停分析（暂停时守护仍常驻，只是不再处理照片）。 */
+        val paused: Boolean = false
     )
 
     private val _results = MutableSharedFlow<ResultBatch>(

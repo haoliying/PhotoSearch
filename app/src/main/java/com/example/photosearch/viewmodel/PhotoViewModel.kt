@@ -15,8 +15,9 @@ import com.example.photosearch.service.AnalysisService
 import com.example.photosearch.service.IncrementBuffer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -90,7 +91,9 @@ data class PhotoSearchState(
     val vlmSummary: String = "",
     val localEnhanceEnabled: Boolean = true,
     val vlmSelectedCount: Int = 0,
-    val vlmUncertainThreshold: Float = 0.55f
+    val vlmUncertainThreshold: Float = 0.55f,
+    // v3.11.2 暂停 / 继续分析
+    val analysisPaused: Boolean = false
 )
 
 /** computeFilters 的产物，主线程一次性写入 StateFlow。 */
@@ -198,7 +201,8 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                     localEnhanceEnabled = AppConfig.isLocalEnhanceEnabled(getApplication()),
                     vlmSelectedCount = AppConfig.getVlmSelectedIds(getApplication()).size,
                     vlmUncertainThreshold = AppConfig.getUncertainThreshold(getApplication()),
-                    vlmSummary = vlmSummaryOf()
+                    vlmSummary = vlmSummaryOf(),
+                    analysisPaused = AppConfig.isAnalysisPaused(getApplication())
                 )
                 scheduleFilters(0)
                 extractExif(photos)
@@ -535,8 +539,11 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                     hasAnalyzed = p.isComplete || p.progress > 0 ||
                             _state.value.hasAnalyzed || metadataCache.isNotEmpty(),
                     // 守护开启时 pending 会被自动处理，无需再显示「继续」
-                    canResume = if (p.isRunning || p.isComplete || _state.value.backgroundWatchActive) false
-                    else remaining > 0 && p.progress > 0
+                    canResume = if (p.isRunning || p.isComplete || p.paused ||
+                        _state.value.backgroundWatchActive) false
+                    else remaining > 0 && p.progress > 0,
+                    // v3.11.2：暂停状态由服务单点下发
+                    analysisPaused = p.paused
                 )
             }
         }
@@ -558,7 +565,8 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                 _state.value = _state.value.copy(
                     backgroundWatchActive = w.active,
                     autoAnalyzedCount = w.autoAnalyzed,
-                    canResume = if (w.active) false else _state.value.canResume
+                    analysisPaused = w.paused,
+                    canResume = if (w.active || w.paused) false else _state.value.canResume
                 )
             }
         }
@@ -578,22 +586,26 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         metadataCache.putAll(batch.results)
         docCache.invalidate(IncrementBuffer.idsToInvalidate(batch.results))
 
-        val st = _state.value
-        val hasQuery = st.searchQuery.isNotBlank() || st.timeRange != null || st.locationQuery != null
-        val (merged, done) = withContext(Dispatchers.Default) {
-            val list = st.allPhotos.map { p ->
+        val merged = withContext(Dispatchers.Default) {
+            val snapshot = _state.value.allPhotos
+            snapshot.map { p ->
                 batch.results[p.id]?.let { m ->
                     p.copy(labels = m.labels, metadata = m, isAnalyzed = true)
                 } ?: p
             }
-            list to list.count { metadataCache.containsKey(it.id) }
         }
-        _state.value = st.copy(
+        // v3.11.2：进度只有一个数据源（AnalysisService.analysisState）。
+        // 旧版这里用全库 metadataCache.count 自己算 doneCount/pendingCount，
+        // 与服务进度两条协程并发写同一状态、口径还不一致，是「进度一次跳几百」
+        // 的根因。现在只更新列表与缓存，进度字段完全不碰；并且基于最新 state
+        // 做 copy，避免把服务刚发布的进度覆盖回旧值。
+        val latest = _state.value
+        val hasQuery = latest.searchQuery.isNotBlank() ||
+                latest.timeRange != null || latest.locationQuery != null
+        _state.value = latest.copy(
             allPhotos = merged,
-            filteredPhotos = if (hasQuery) st.filteredPhotos else merged,
-            hasAnalyzed = true,
-            doneCount = done,
-            pendingCount = (merged.size - done).coerceAtLeast(0)
+            filteredPhotos = if (hasQuery) latest.filteredPhotos else merged,
+            hasAnalyzed = true
         )
         if (hasQuery) scheduleFilters(SEARCH_DEBOUNCE_MS)
     }
@@ -696,6 +708,34 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
 
     /** 「继续分析」与「开始分析」走同一入口：Service 按 photoId 差集决定从哪开始。 */
     fun resumeAnalysis() = startAnalysis()
+
+    /**
+     * v3.11.2：暂停分析。守护仍常驻（相册监听、通知都在），只是不再处理照片；
+     * 当前正在跑的 worker 把手上这张落盘后挂起，已分析结果不丢。
+     */
+    fun pauseBackgroundAnalysis() {
+        val app = getApplication<Application>()
+        AppConfig.setAnalysisPaused(app, true)
+        if (!AnalysisService.isWatchActive()) AnalysisService.requestWatch(app)
+        AnalysisService.requestPause(app)
+        _state.value = _state.value.copy(
+            analysisPaused = true, isAnalyzing = false, canResume = false
+        )
+    }
+
+    /**
+     * v3.11.2：继续分析。唤醒服务的低频心跳立刻重新对账，按 photoId 差集
+     * 从剩余照片续跑，不重复分析已完成部分。
+     */
+    fun continueBackgroundAnalysis() {
+        val app = getApplication<Application>()
+        AppConfig.setAnalysisPaused(app, false)
+        if (!AnalysisService.isWatchActive()) AnalysisService.requestWatch(app)
+        AnalysisService.requestContinue(app)
+        _state.value = _state.value.copy(
+            analysisPaused = false, isAnalyzing = true, canResume = false
+        )
+    }
 
     /**
      * v3.10.0：应用回到前台时确保后台守护在运行。
@@ -989,63 +1029,77 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
             val updatedById = HashMap<Long, PhotoItem>(ids.size)
 
             try {
-                // v3.11.1：批量重分析同样按「分析并发数」分块并发 —— 块内多张并行
-                // 分析（ML Kit 检测器线程安全），块间串行更新 UI 状态与进度。
+                // v3.11.2：与后台分析一致，改为滑动窗口真并发 —— 固定 N 个 worker
+                // 从同一队列取任务，谁完成立刻补下一张，消除整块屏障的木桶效应。
                 val parallelism = AnalysisScheduling.coerceParallelism(
                     AppConfig.getAnalysisParallelism(context)
                 )
-                val chunks = AnalysisScheduling.chunksOf(ids, parallelism)
+                val workChannel = Channel<Long>(Channel.UNLIMITED)
+                ids.forEach { workChannel.trySend(it) }
+                workChannel.close()
+                val resultChannel = Channel<PhotoItem?>(Channel.UNLIMITED)
                 var processedCount = 0
 
-                for (chunk in chunks) {
-                    ensureActive()
-                    val processed: List<PhotoItem> = coroutineScope {
-                        chunk.map { photoId ->
-                            async(Dispatchers.IO) {
+                coroutineScope {
+                    val workers = (0 until parallelism).map {
+                        launch(Dispatchers.IO) {
+                            for (photoId in workChannel) {
+                                ensureActive()
                                 val photo = _state.value.allPhotos.find { it.id == photoId }
-                                    ?: return@async null
-                                try {
-                                    val onDeviceMetadata = analyzer.analyzePhoto(photo.uri, context)
-                                    var description = ""
-                                    var vlmKeywords = listOf<String>()
-                                    val decision = VlmPolicy.decide(
-                                        vlmConfig, photo.id,
-                                        isNew = false,
-                                        hasDescription = false,
-                                        confidence = VlmPolicy.localConfidence(onDeviceMetadata)
-                                    )
-                                    if (decision.useVlm && vlmAnalyzer != null) {
-                                        try {
-                                            val vlmResult = vlmAnalyzer.analyzePhoto(photo.uri)
-                                            if (vlmResult.success) {
-                                                description = vlmResult.description
-                                                vlmKeywords = vlmResult.keywords
+                                val result: PhotoItem? = if (photo == null) null else {
+                                    try {
+                                        val onDeviceMetadata = analyzer.analyzePhoto(photo.uri, context)
+                                        var description = ""
+                                        var vlmKeywords = listOf<String>()
+                                        val decision = VlmPolicy.decide(
+                                            vlmConfig, photo.id,
+                                            isNew = false,
+                                            hasDescription = false,
+                                            confidence = VlmPolicy.localConfidence(onDeviceMetadata)
+                                        )
+                                        if (decision.useVlm && vlmAnalyzer != null) {
+                                            try {
+                                                val vlmResult = vlmAnalyzer.analyzePhoto(photo.uri)
+                                                if (vlmResult.success) {
+                                                    description = vlmResult.description
+                                                    vlmKeywords = vlmResult.keywords
+                                                }
+                                            } catch (_: Exception) { }
+                                            synchronized(vlmConsumeLock) {
+                                                AppConfig.removeVlmSelectedIds(context, listOf(photo.id))
                                             }
-                                        } catch (_: Exception) { }
-                                        synchronized(vlmConsumeLock) {
-                                            AppConfig.removeVlmSelectedIds(context, listOf(photo.id))
                                         }
-                                    }
-                                    val metadata = onDeviceMetadata.copy(
-                                        photoId = photo.id, description = description, vlmKeywords = vlmKeywords
-                                    )
-                                    metadataCache[photo.id] = metadata
-                                    AnalysisService.analyzedMetadata[photo.id] = metadata
-                                    photo.copy(
-                                        labels = metadata.labels, metadata = metadata, isAnalyzed = true
-                                    )
-                                } catch (_: Exception) { null }
+                                        val metadata = onDeviceMetadata.copy(
+                                            photoId = photo.id, description = description,
+                                            vlmKeywords = vlmKeywords
+                                        )
+                                        metadataCache[photo.id] = metadata
+                                        AnalysisService.analyzedMetadata[photo.id] = metadata
+                                        photo.copy(
+                                            labels = metadata.labels, metadata = metadata,
+                                            isAnalyzed = true
+                                        )
+                                    } catch (_: Exception) { null }
+                                }
+                                resultChannel.send(result)
                             }
-                        }.mapNotNull { it.await() }
+                        }
+                    }
+                    launch {
+                        workers.joinAll()
+                        resultChannel.close()
                     }
 
-                    processed.forEach { updatedById[it.id] = it }
-                    processedCount += processed.size
-
-                    // 进度刷新节流：约每 10 张或每块末更新一次，避免高频重组
-                    if (processedCount % 10 == 0 || chunk === chunks.last()) {
-                        _state.value = _state.value.copy(batchProgress = processedCount)
+                    // 唯一协调点：逐张累加进度，避免高频重组、也避免一次跳几百
+                    for (res in resultChannel) {
+                        ensureActive()
+                        if (res != null) updatedById[res.id] = res
+                        processedCount++
+                        if (processedCount % 10 == 0 || processedCount == ids.size) {
+                            _state.value = _state.value.copy(batchProgress = processedCount)
+                        }
                     }
+                    workers.joinAll()
                 }
 
                 // v3.9.0：只追加本批变化的 id，避免全表扫描

@@ -176,7 +176,11 @@ class MainActivity : ComponentActivity() {
                                 backgroundWatchActive = state.backgroundWatchActive,
                                 backgroundWatchEnabled = state.backgroundWatchEnabled,
                                 autoAnalyzedCount = state.autoAnalyzedCount,
-                                onToggleWatch = { viewModel.setBackgroundWatch(!state.backgroundWatchEnabled) }
+                                onToggleWatch = { viewModel.setBackgroundWatch(!state.backgroundWatchEnabled) },
+                                // v3.11.2 暂停 / 继续分析
+                                analysisPaused = state.analysisPaused,
+                                onPauseAnalysis = { viewModel.pauseBackgroundAnalysis() },
+                                onContinueAnalysis = { viewModel.continueBackgroundAnalysis() }
                             )
                         }
                     }

@@ -119,7 +119,11 @@ fun HomeScreen(
     backgroundWatchActive: Boolean = false,
     backgroundWatchEnabled: Boolean = true,
     autoAnalyzedCount: Int = 0,
-    onToggleWatch: () -> Unit = {}
+    onToggleWatch: () -> Unit = {},
+    // v3.11.2 暂停 / 继续分析
+    analysisPaused: Boolean = false,
+    onPauseAnalysis: () -> Unit = {},
+    onContinueAnalysis: () -> Unit = {}
 ) {
     var showSearch by rememberSaveable { mutableStateOf(false) }
     var showFilters by rememberSaveable { mutableStateOf(false) }
@@ -358,7 +362,10 @@ fun HomeScreen(
                     onOpenHelp = onOpenHelp,
                     backgroundWatchActive = backgroundWatchActive,
                     autoAnalyzedCount = autoAnalyzedCount,
-                    onToggleWatch = onToggleWatch
+                    onToggleWatch = onToggleWatch,
+                    analysisPaused = analysisPaused,
+                    onPauseAnalysis = onPauseAnalysis,
+                    onContinueAnalysis = onContinueAnalysis
                 )
             }
 
@@ -794,17 +801,49 @@ private fun AnalysisStatusBar(
     onOpenHelp: () -> Unit,
     backgroundWatchActive: Boolean,
     autoAnalyzedCount: Int,
-    onToggleWatch: () -> Unit
+    onToggleWatch: () -> Unit,
+    // v3.11.2
+    analysisPaused: Boolean,
+    onPauseAnalysis: () -> Unit,
+    onContinueAnalysis: () -> Unit
 ) {
     when {
+        // v3.11.2：暂停优先展示，明确告知守护仍在、结果不丢、可随时继续
+        analysisPaused -> Surface(color = Surface) {
+            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("已暂停分析 · 已完成 $progress / $total", fontSize = 11.sp,
+                        color = OnSurface.copy(alpha = 0.8f))
+                    Text("后台守护仍在运行，点继续从剩余照片续跑，不会从头开始", fontSize = 10.sp,
+                        color = OnSurface.copy(alpha = 0.55f))
+                }
+                Button(onClick = onContinueAnalysis,
+                    colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                ) { Text("继续分析", fontSize = 11.sp) }
+            }
+        }
         // v3.9.0：进度口径是「相册里已完整分析的张数」，不是本轮处理序号
         isAnalyzing -> {
             val remain = (total - progress).coerceAtLeast(0)
-            ThinProgress(
-                if (remain > 0) "正在分析：已完成 $progress / $total，还剩 $remain 张（可随时退出，下次自动继续）"
-                else "正在收尾…",
-                progress, total
-            )
+            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
+                ThinProgress(
+                    if (remain > 0) "正在分析：已完成 $progress / $total，还剩 $remain 张（熄屏后台也会继续）"
+                    else "正在收尾…",
+                    progress, total
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("多张并行分析中，随时可暂停", fontSize = 10.sp,
+                        color = OnSurface.copy(alpha = 0.55f),
+                        modifier = Modifier.weight(1f))
+                    TextButton(onClick = onPauseAnalysis,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
+                        Text("暂停分析", fontSize = 11.sp)
+                    }
+                }
+            }
         }
         canResume -> Surface(color = Surface) {
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
@@ -866,8 +905,12 @@ private fun AnalysisStatusBar(
                     modifier = Modifier.weight(1f)
                 )
                 TextButton(
+                    onClick = onPauseAnalysis,
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                ) { Text("暂停", fontSize = 10.sp) }
+                TextButton(
                     onClick = onToggleWatch,
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
                 ) { Text("停止", fontSize = 10.sp) }
             }
         }

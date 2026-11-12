@@ -21,12 +21,10 @@ import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.face.FaceDetector
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 
 /**
@@ -70,11 +68,15 @@ class EnhancedImageAnalyzer(context: Context) {
 
     /**
      * Analyze a photo and return rich metadata.
+     *
+     * v3.11.2：不再强制切到 Dispatchers.Default。调用方（AnalysisService）会把
+     * 本方法放到「低优先级专用固定线程池」上，内部 4 个 async 继承同一个 dispatcher：
+     *  - 分析与检索彻底隔离，不抢搜索线程的 CPU；
+     *  - 多张照片真并行（v3.11.1 强制 Default 会让所有 worker 挤同一个池）。
      */
     suspend fun analyzePhoto(uri: Uri, context: Context): PhotoMetadata {
-        return withContext(Dispatchers.Default) {
-            try {
-                val bitmap = loadBitmap(uri, context) ?: return@withContext PhotoMetadata(photoId = 0)
+        return try {
+                val bitmap = loadBitmap(uri, context) ?: return PhotoMetadata(photoId = 0)
 
                 // Run all analyses in parallel
                 val (labels, objects, faces, colors) = coroutineScope {
@@ -128,10 +130,9 @@ class EnhancedImageAnalyzer(context: Context) {
                     faceCount = faceList.size,
                     sceneTags = sceneTags
                 )
-            } catch (e: Exception) {
-                e.printStackTrace()
-                PhotoMetadata(photoId = 0, isAnalyzed = true)
-            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            PhotoMetadata(photoId = 0, isAnalyzed = true)
         }
     }
 
@@ -180,8 +181,12 @@ class EnhancedImageAnalyzer(context: Context) {
                 BitmapFactory.decodeFileDescriptor(fd, null, bounds)
                 if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
-                // 3) 按采样解码（max 1024px，与流路径一致）
-                val sampleSize = calculateInSampleSize(bounds.outWidth, bounds.outHeight, 1024, 1024)
+                // 3) v3.11.2：按采样解码（最大边长 768px，ML Kit 内部仍会缩放到
+                //    224~320 推理，标签精度几乎不变，解码时间与内存明显下降）
+                val sampleSize = calculateInSampleSize(
+                    bounds.outWidth, bounds.outHeight,
+                    AnalysisScheduling.DECODE_MAX_PX, AnalysisScheduling.DECODE_MAX_PX
+                )
                 val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
                 seekStart()
                 val bitmap = BitmapFactory.decodeFileDescriptor(fd, null, decodeOptions) ?: return null
@@ -206,7 +211,10 @@ class EnhancedImageAnalyzer(context: Context) {
                 inputStream.close()
 
                 // Calculate sample size for analysis (max 1024px)
-                val sampleSize = calculateInSampleSize(options.outWidth, options.outHeight, 1024, 1024)
+                val sampleSize = calculateInSampleSize(
+                    options.outWidth, options.outHeight,
+                    AnalysisScheduling.DECODE_MAX_PX, AnalysisScheduling.DECODE_MAX_PX
+                )
 
                 // Second pass: decode with sample size
                 context.contentResolver.openInputStream(uri)?.use { stream ->

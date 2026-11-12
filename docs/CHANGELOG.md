@@ -7,8 +7,8 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 版本名 | 3.11.1 |
-| versionCode | 15 |
+| 版本名 | 3.11.2 |
+| versionCode | 16 |
 | 发布日期 | 2026-11-12 |
 | 包名 | `com.example.photosearch` |
 | 最低 Android | API 26（Android 8.0） |
@@ -19,6 +19,7 @@
 
 | 版本 | 日期 | 主题 | 详细文档 |
 | --- | --- | --- | --- |
+| v3.11.2 | 2026-11-12 | 真并发提速、后台持续分析、进度平滑、暂停 / 继续分析 | [CHANGELOG_v3.11.2.md](CHANGELOG_v3.11.2.md) |
 | v3.11.1 | 2026-11-12 | 不用大模型时的分析速度大幅提升（块内并发 + 单 fd 复用） | [CHANGELOG_v3.11.1.md](CHANGELOG_v3.11.1.md) |
 | v3.11.0 | 2026-11-11 | 大模型使用策略、选择照片交给大模型、不依赖大模型的准确度增强 | [CHANGELOG_v3.11.0.md](CHANGELOG_v3.11.0.md) · [ACCURACY_WITHOUT_VLM.md](ACCURACY_WITHOUT_VLM.md) |
 | v3.10.0 | 2026-11-10 | 后台常驻自动分析、相册变化监听、检索隔离 | [CHANGELOG_v3.10.0.md](CHANGELOG_v3.10.0.md) · [BACKGROUND_ANALYSIS.md](BACKGROUND_ANALYSIS.md) |

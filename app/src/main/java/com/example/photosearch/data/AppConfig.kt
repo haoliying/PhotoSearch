@@ -31,6 +31,8 @@ object AppConfig {
     private const val KEY_LOCAL_ENHANCE = "local_enhance_enabled"
     // v3.11.1：端侧分析并发数（不用大模型时的分析速度）
     private const val KEY_ANALYSIS_PARALLELISM = "analysis_parallelism"
+    // v3.11.2：用户显式「暂停分析」，持久化；服务被系统重建后仍保持暂停
+    private const val KEY_ANALYSIS_PAUSED = "analysis_paused"
 
     private fun prefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -115,9 +117,9 @@ object AppConfig {
     // ------------------------------------------------------------------
 
     /**
-     * 端侧分析并发数（1..4，默认 2）。
-     * 1 = 与 v3.11.0 一致的逐张串行（最省电、对前台零干扰）；
-     * 4 = 极速（四路并行，首次全量分析明显更快，可能发热）。
+     * v3.11.2：端侧分析并发数（1..8，默认 4）。
+     * 1 = 逐张串行（最省电、对前台零干扰）；4 = 默认，吃满中端机 CPU；
+     * 8 = 极速（首次全量分析最快，可能发热）。滑动窗口调度，谁完成谁补位。
      */
     fun getAnalysisParallelism(context: Context): Int =
         com.example.photosearch.service.AnalysisScheduling.coerceParallelism(
@@ -217,5 +219,20 @@ object AppConfig {
 
     fun setWatchPending(context: Context, pending: Boolean) {
         prefs(context).edit().putBoolean(KEY_WATCH_PENDING, pending).apply()
+    }
+
+    // ------------------------------------------------------------------
+    // v3.11.2 暂停 / 继续分析
+    // ------------------------------------------------------------------
+
+    /**
+     * 用户显式暂停分析。持久化到磁盘：服务被系统回收后 START_STICKY 重建时
+     * 读取该值，仍保持暂停，不会被开机 / 心跳偷偷恢复 —— 用户意图优先。
+     */
+    fun isAnalysisPaused(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_ANALYSIS_PAUSED, false)
+
+    fun setAnalysisPaused(context: Context, paused: Boolean) {
+        prefs(context).edit().putBoolean(KEY_ANALYSIS_PAUSED, paused).apply()
     }
 }

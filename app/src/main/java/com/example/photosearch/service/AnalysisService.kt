@@ -12,6 +12,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.photosearch.MainActivity
@@ -22,32 +23,34 @@ import com.example.photosearch.search.VlmMode
 import com.example.photosearch.search.VlmPolicy
 import com.example.photosearch.search.VlmPolicyConfig
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * v3.10.0：**常驻后台守护 + 相册变化监听 + 增量自动分析 + 检索隔离**。
  *
- * v3.9.0 及以前是一次性前台服务：跑完一轮就 stopSelf()、START_NOT_STICKY，
- * 既不常驻也不感知相册变化，新拍的照片只能靠手动刷新或下次回到前台才发现；
- * 而且服务完成时会让 ViewModel 做「全量合并 + docCache.clear() + 全库检索」，
- * 若常驻并不断有小批次完成，会反复清空几万张索引、卡住前端搜索。
+ * v3.11.2 针对「速度仍不快 / 后台就不分析了 / 进度一次跳几百」三处反馈重写调度：
  *
- * 现在：
- *  - START_STICKY 常驻，注册 [MediaStoreObserver] 监听相册；分析循环跑完不 stopSelf，
- *    继续保持监听；开机/升级由 [com.example.photosearch.receiver.BootReceiver] 尽力恢复，
- *    App 回到前台兜底拉起（MainActivity.onResume）。
- *  - 相册变化 → 重新查 MediaStore → [AnalysisPlanner.diff] 求差 → [AnalysisPlanner.plan]
- *    只挑新增/未完成的照片分析，每张立即 appendResult 落盘（磁盘是唯一权威）。
- *  - 分析结果通过 [AnalysisEvents] 以「增量批次」通知前端；[IncrementBuffer] 负责
- *    去重、后写覆盖与节流。前端只合并这几张、只失效这几张的文档缓存，
- *    **绝不全量 clear / 全库重跑检索** —— 后台分析不影响前端搜索。
- *  - 分析循环跑在低优先级单线程（THREAD_PRIORITY_BACKGROUND），
- *    检索在 Dispatchers.Default，主线程只做 O(1) 状态赋值，三者互不抢占、无共享锁。
- *  - 常驻通知带「停止守护」action，用户随时可关；设置页也有开关。
+ *  1. **滑动窗口真并发**：v3.11.1 是「块内 N 张并发、块间串行收尾」，整块屏障
+ *     让最慢的一张拖住同块其他线程。现在固定 N 个 worker 从 Channel 取任务，
+ *     任何一张完成立刻补下一张，全程 N 张 in-flight；并发上限 1..8（默认 4）。
+ *     分析跑在**低优先级专用固定线程池**，与检索用的 Dispatchers.Default 隔离。
+ *  2. **后台持续分析**：持有 PARTIAL_WAKE_LOCK（熄屏后 CPU 不再被冻结），
+ *     并且空闲时进入低频心跳对账（60s），即使 ContentObserver 没回调也能
+ *     发现新照片并续跑；通知栏实时显示进度与暂停/继续入口。
+ *  3. **进度单一数据源**：进度只由本服务的协调协程逐张累加并上报，
+ *     ViewModel 不再用全库 count 自己算；[AnalysisControl.monotonic] 保证
+ *     不回退，[AnalysisControl.shouldEmit] 时间节流且收尾必发最终值。
+ *  4. **暂停 / 继续**：显式暂停状态持久化，服务重建后仍保持；暂停时当前
+ *     任务收尾即挂起，继续后从剩余照片续跑，不重复、不丢结果。
+ *
+ * 磁盘（AnalysisResultStore）始终是结果唯一权威，增量事件只是运行期加速；
+ * 前端只合并这批 id、只失效这批文档缓存，**绝不全量 clear / 全库重算检索**。
  */
 class AnalysisService : Service() {
 
@@ -59,11 +62,13 @@ class AnalysisService : Service() {
         const val ACTION_SCAN = "com.example.photosearch.action.SCAN"
         const val ACTION_REANALYZE_ALL = "com.example.photosearch.action.REANALYZE_ALL"
         const val ACTION_STOP = "com.example.photosearch.action.STOP"
-        /** 兼容旧调用点（v3.9.0 的 resume）。 */
+        /** 兼容旧调用点（v3.9.0 的 resume），语义仍是「拉起守护」。 */
         const val ACTION_RESUME = "com.example.photosearch.action.RESUME"
+        /** v3.11.2：用户显式暂停 / 继续分析（与「启动守护」的 RESUME 区分）。 */
+        const val ACTION_PAUSE_ANALYSIS = "com.example.photosearch.action.PAUSE_ANALYSIS"
+        const val ACTION_CONTINUE = "com.example.photosearch.action.CONTINUE"
 
         private const val TAG = "AnalysisService"
-        private const val PROGRESS_EMIT_STEP = 20
         private const val RESULT_BATCH_MAX = 20
         private const val RESULT_BATCH_INTERVAL_MS = 300L
 
@@ -78,8 +83,17 @@ class AnalysisService : Service() {
         var watchActive: Boolean = false
             private set
 
+        /**
+         * v3.11.2：暂停标志放 companion，服务被系统回收后重建时也能读到；
+         * 同时由 AppConfig 持久化，用户意图不会被开机/心跳偷偷覆盖。
+         */
+        @Volatile
+        var pausedFlag: Boolean = false
+            private set
+
         fun isRunning(): Boolean = _analysisState.value.isRunning
         fun isWatchActive(): Boolean = watchActive
+        fun isPaused(): Boolean = pausedFlag
 
         fun reset() {
             _analysisState.value = AnalysisProgress()
@@ -91,6 +105,8 @@ class AnalysisService : Service() {
         fun requestWatch(context: Context) = start(context, ACTION_WATCH_START)
         fun requestScan(context: Context) = start(context, ACTION_SCAN)
         fun requestReanalyzeAll(context: Context) = start(context, ACTION_REANALYZE_ALL)
+        fun requestPause(context: Context) = start(context, ACTION_PAUSE_ANALYSIS)
+        fun requestContinue(context: Context) = start(context, ACTION_CONTINUE)
 
         fun requestStop(context: Context) {
             if (!watchActive) return
@@ -124,23 +140,64 @@ class AnalysisService : Service() {
         val isComplete: Boolean = false,
         val isResumed: Boolean = false,
         val vlmEnabled: Boolean = false,
-        val vlmErrors: Int = 0
+        val vlmErrors: Int = 0,
+        /** v3.11.2：显式暂停中（守护仍常驻，只是不处理照片）。 */
+        val paused: Boolean = false
     )
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     /**
-     * 分析专用低优先级线程：把 Linux nice 调到后台级，避免几万张照片的
-     * 图片解码 / JSON 落盘与主线程、检索线程（Dispatchers.Default）抢 CPU。
-     * 这是「后台分析不影响前端搜索」的第一层隔离。
+     * v3.11.2：分析专用**固定线程池**（低 nice 值），不再是 v3.11.1 的单线程 executor。
+     * 池按当前「分析并发数」懒创建，配置变化时重建；onDestroy 才真正 shutdown。
      */
-    private val analysisExecutor = Executors.newSingleThreadExecutor { r ->
-        Thread({
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
-            r.run()
-        }, "ps-analysis").apply { isDaemon = true }
+    @Volatile
+    private var poolParallelism = 0
+    private var analysisPool: ExecutorService? = null
+    private var analysisDispatcher: CoroutineDispatcher = Dispatchers.Default
+
+    @Synchronized
+    private fun prepareAnalysisPool() {
+        val p = AnalysisScheduling.coerceParallelism(AppConfig.getAnalysisParallelism(this))
+        if (p == poolParallelism && analysisPool != null && !analysisPool!!.isShutdown) return
+        analysisPool?.shutdown()
+        val pool = Executors.newFixedThreadPool(p) { r ->
+            Thread({
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                r.run()
+            }, "ps-analysis-$p").apply { isDaemon = true }
+        }
+        analysisPool = pool
+        analysisDispatcher = pool.asCoroutineDispatcher()
+        poolParallelism = p
     }
-    private val analysisDispatcher = analysisExecutor.asCoroutineDispatcher()
+
+    /** v3.11.2：熄屏后保持 CPU 运行；分析时持有、空闲/暂停时释放。 */
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    @Synchronized
+    private fun acquireWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) return
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+            wakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK, "PhotoSearch:Analysis"
+            ).apply {
+                setReferenceCounted(false)
+                acquire(AnalysisControl.WAKELOCK_TIMEOUT_MS)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "获取 WakeLock 失败（不影响前台分析）", e)
+        }
+    }
+
+    @Synchronized
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) wakeLock!!.release()
+        } catch (_: Exception) { }
+        wakeLock = null
+    }
 
     private lateinit var resultStore: AnalysisResultStore
     private lateinit var observer: MediaStoreObserver
@@ -164,11 +221,24 @@ class AnalysisService : Service() {
     @Volatile
     private var vlmDegraded = false
 
+    /** v3.11.2：进度上报的上一帧值与时间，跨轮重置，避免节流把首帧吞掉。 */
     private var lastEmittedProgress = -1
     private var lastEmitTime = 0L
 
+    /** v3.11.2：低频心跳的唤醒信号，「继续分析」时立刻结束等待重新对账。 */
+    @Volatile
+    private var resumeSignal: CompletableDeferred<Unit>? = null
+
     /** v3.11.1：并发分析时「手动选择消费」的互斥锁，避免 SharedPreferences 读改写竞态。 */
     private val vlmConsumeLock = Any()
+
+    /**
+     * v3.11.2：循环代次号。「重新分析全部」会 cancel 旧循环并立刻起新循环，
+     * 旧循环的 finally 若晚于新循环的初始化执行，会误关掉新循环的分析器 /
+     * 唤醒锁。这里让 finally 只在自己仍是最新一代时做资源清理。
+     */
+    @Volatile
+    private var loopGeneration = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -176,6 +246,7 @@ class AnalysisService : Service() {
         super.onCreate()
         createNotificationChannel()
         resultStore = AnalysisResultStore(applicationContext)
+        pausedFlag = AppConfig.isAnalysisPaused(this)
         observer = MediaStoreObserver(serviceScope) {
             // ContentObserver 防抖后回调：只做增量对账，不重新启动服务
             dispatchAnalysis(forceFull = false)
@@ -184,9 +255,7 @@ class AnalysisService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // 契约：startForegroundService 启动后必须尽快进入前台。
-        // 三参数重载（带 foregroundServiceType）是 API 29+ 才有的方法，
-        // 在 API 26~28 上直接调用会 NoSuchMethodError，这里按版本分支。
-        val notification = buildNotification("后台守护中 · 新照片将自动分析", 0, 0)
+        val notification = buildNotification(currentIdleText(), 0, 0)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID, notification,
@@ -203,54 +272,85 @@ class AnalysisService : Service() {
         watchActive = true
         AppConfig.markWatchStarted(this)
         AppConfig.setWatchPending(this, false)
-        // 守护关闭时不注册相册监听、跑完一轮即退出（退化为 v3.9.0 的一次性分析）
         if (watchEnabled) observer.register(contentResolver) else observer.unregister(contentResolver)
-        AnalysisEvents.emitWatch(
-            AnalysisEvents.WatchState(
-                active = true,
-                autoAnalyzed = autoAnalyzedCount,
-                analyzing = analysisJob?.isActive == true
-            )
-        )
+        emitWatch(analyzing = analysisJob?.isActive == true)
 
         when (intent?.action) {
             ACTION_STOP -> {
                 stopWatch()
                 return START_NOT_STICKY
             }
+            ACTION_PAUSE_ANALYSIS -> {
+                setPaused(true)
+                // 不取消 job：正在跑的任务收尾后由 awaitIfPaused 挂起，已落盘结果不丢
+                updateState(isRunning = false, paused = true)
+                updateNotification(
+                    "已暂停分析 · 已完成 ${_analysisState.value.progress} / ${_analysisState.value.total}",
+                    _analysisState.value.progress, _analysisState.value.total
+                )
+            }
+            ACTION_CONTINUE -> {
+                setPaused(false)
+                // 立刻唤醒低频心跳；若循环已不在则重新拉起
+                resumeSignal?.complete(Unit)
+                if (analysisJob?.isActive != true) dispatchAnalysis(forceFull = false)
+                updateState(paused = false)
+                updateNotification(
+                    "继续分析 · 从剩余照片续跑",
+                    _analysisState.value.progress, _analysisState.value.total
+                )
+            }
             ACTION_REANALYZE_ALL -> dispatchAnalysis(forceFull = true, clearFirst = true)
             ACTION_SCAN -> dispatchAnalysis(forceFull = false)
             ACTION_WATCH_START, ACTION_RESUME, null -> {
-                // 首次拉起（含 START_STICKY 系统重启）做一次全量对账续跑；
-                // 服务已常驻时什么都不做 —— ContentObserver 已在监听，避免每次
-                // onResume 都重复全量读盘。
                 if (!wasActive) dispatchAnalysis(forceFull = false)
             }
         }
-        // 守护开启才常驻：被系统回收后由系统重启，磁盘结果是权威，重启即自动续跑；
-        // 守护关闭时返回 NOT_STICKY，服务跑完一轮自行退出。
         return if (watchEnabled) START_STICKY else START_NOT_STICKY
+    }
+
+    private fun setPaused(value: Boolean) {
+        pausedFlag = value
+        AppConfig.setAnalysisPaused(this, value)
+        emitWatch(analyzing = analysisJob?.isActive == true && !value)
+    }
+
+    /** v3.11.2：统一构造守护状态，paused 单点写入，避免多处状态不一致。 */
+    private fun emitWatch(analyzing: Boolean, autoAnalyzed: Int = autoAnalyzedCount) {
+        AnalysisEvents.emitWatch(
+            AnalysisEvents.WatchState(
+                active = watchActive,
+                autoAnalyzed = autoAnalyzed,
+                analyzing = analyzing,
+                paused = pausedFlag
+            )
+        )
     }
 
     /**
      * 串行调度分析。已有循环在跑且非 forceFull 时直接跳过（循环末尾会再对账一次，
      * 不会漏掉分析期间新增的照片），避免并发分析同一批、也避免高频唤醒。
+     * v3.11.2：循环本身跑在 Dispatchers.Default，真正的分析 worker 在专用低优先级池。
      */
     private fun dispatchAnalysis(forceFull: Boolean = false, clearFirst: Boolean = false) {
+        // v3.11.2：用户显式暂停时完全静默（不启动循环、不被相册变化唤醒）；
+        // 「继续分析」会先清掉 pausedFlag 再重新拉起，按差集续跑。
+        if (pausedFlag && !forceFull) return
         val active = analysisJob?.isActive == true
         if (active && !forceFull) return
         if (active) analysisJob?.cancel()
-        analysisJob = serviceScope.launch(analysisDispatcher) {
-            runUntilSettled(clearFirst)
+        val gen = ++loopGeneration
+        analysisJob = serviceScope.launch(Dispatchers.Default) {
+            runUntilSettled(clearFirst, gen)
         }
     }
 
     /**
      * 对账 + 分析，直到相册里没有待分析照片为止。
-     * 跑完一轮后再次循环：若分析期间又有新照片进来，下一轮会检出并继续，
-     * 否则 plan.complete 直接返回 —— 服务本身不退出，继续靠 observer 监听。
+     * v3.11.2：守护开启且跑完一轮后**不退出循环**，进入低频心跳持续对账，
+     * 保证「退到后台也一直在分析新照片」，而不是只依赖 ContentObserver 回调。
      */
-    private suspend fun runUntilSettled(clearFirst: Boolean) {
+    private suspend fun runUntilSettled(clearFirst: Boolean, generation: Long) {
         if (clearFirst) {
             resultStore.clear()
             analyzedMetadata.clear()
@@ -259,14 +359,14 @@ class AnalysisService : Service() {
             autoAnalyzedCount = 0
             completed = false
             AnalysisEvents.resetWatch()
-            AnalysisEvents.emitWatch(AnalysisEvents.WatchState(active = true))
+            emitWatch(analyzing = true)
         }
 
+        prepareAnalysisPool()
         val metaFlushStep = AppConfig.getSegmentSize(this@AnalysisService).coerceIn(10, 200)
         val repository = PhotoRepository(this@AnalysisService)
 
         onDeviceAnalyzer = EnhancedImageAnalyzer(this@AnalysisService)
-        // 是否真正联网由逐张策略决定；这里只创建客户端对象（构造不发起请求）
         vlmAnalyzer = VisionLanguageAnalyzer(this@AnalysisService)
 
         try {
@@ -279,7 +379,6 @@ class AnalysisService : Service() {
 
                 val delta = AnalysisPlanner.diff(lastAlbumIds, ids)
                 lastAlbumIds = ids.toHashSet()
-                // 只对「运行期变化」通知前端增量刷新；首次全量对账由 App 自己 loadPhotos 覆盖
                 if (hasReconciledOnce && delta.changed) {
                     AnalysisEvents.emitAlbum(
                         AnalysisEvents.AlbumChanged(delta.added.size, delta.removed.size)
@@ -287,8 +386,6 @@ class AnalysisService : Service() {
                 }
                 hasReconciledOnce = true
 
-                // v3.11.0：每轮重新读取策略，用户在设置页改策略 / 勾选照片后下一轮即生效，
-                // 且已消费的「手动选择」不会再被反复排进队列。
                 val vlmConfig = readVlmConfig()
                 val useVlm = vlmConfig.enabled
                 val planPolicy = AnalysisPlanner.VlmPlanPolicy(
@@ -309,36 +406,43 @@ class AnalysisService : Service() {
 
                 if (plan.complete) {
                     resultStore.markComplete(photos.size, analyzed.size)
-                    emitIdle(photos.size, useVlm)
+                    emitIdle(photos.size, useVlm, minOf(analyzed.size, photos.size))
                     completed = true
-                    // 守护关闭：退化为一次性分析（v3.9.0 行为），跑完即退出，不常驻
+                    releaseWakeLock()
                     if (!AppConfig.isBackgroundWatchEnabled(this@AnalysisService)) {
                         stopAfterOneShot()
+                        return
                     }
-                    return
+                    // v3.11.2 低频心跳：只查 MediaStore id（不读 JSONL），
+                    // 有新照片 / 用户点「继续」就立刻回到外层重新对账续跑。
+                    awaitNextHeartbeat(repository)
+                    continue
                 }
 
-                // 防死循环：上一轮已完整跑过同样一批、期间又没有新照片进来，
-                // 说明是「云端 AI 持续失败 / 手动选择已消费」等无法在本轮满足的情况，
-                // 退出循环交给相册变化或用户下次手动触发，避免反复消耗 API。
                 val signature = plan.pendingIds.toHashSet()
                 if (round > 0 && signature == lastPendingSignature && delta.added.isEmpty()) {
                     Log.w(TAG, "同一批照片重复待处理，停止本轮对账循环")
                     resultStore.markProgress(photos.size, plan.doneCount)
-                    emitIdle(photos.size, useVlm)
+                    emitIdle(photos.size, useVlm, plan.doneCount)
                     completed = true
-                    if (!AppConfig.isBackgroundWatchEnabled(this@AnalysisService)) stopAfterOneShot()
-                    return
+                    releaseWakeLock()
+                    if (!AppConfig.isBackgroundWatchEnabled(this@AnalysisService)) {
+                        stopAfterOneShot()
+                        return
+                    }
+                    awaitNextHeartbeat(repository)
+                    lastPendingSignature = emptySet()
+                    continue
                 }
                 lastPendingSignature = signature
 
                 val byId = HashMap<Long, PhotoItem>(photos.size * 2)
                 photos.forEach { byId[it.id] = it }
 
+                acquireWakeLock()
                 runPlan(photos, byId, plan, vlmConfig, metaFlushStep,
                     autoTriggered = hasReconciledOnce && round > 0)
                 round++
-                // 继续 while：把分析期间新增的照片也纳入下一次对账
             }
         } catch (e: CancellationException) {
             throw e
@@ -349,16 +453,50 @@ class AnalysisService : Service() {
             if (!completed && analyzedMetadata.isNotEmpty()) {
                 resultStore.markProgress(analyzedMetadata.size, analyzedMetadata.size)
             }
-            onDeviceAnalyzer?.close()
-            onDeviceAnalyzer = null
-            vlmAnalyzer = null
-            AnalysisEvents.emitWatch(
-                AnalysisEvents.WatchState(active = watchActive, autoAnalyzed = autoAnalyzedCount)
-            )
+            // 只有当前代才清理共享资源；旧代已被 forceFull 取代，不要动新代的状态
+            if (generation == loopGeneration) {
+                releaseWakeLock()
+                onDeviceAnalyzer?.close()
+                onDeviceAnalyzer = null
+                vlmAnalyzer = null
+                emitWatch(analyzing = false)
+            }
         }
     }
 
-    /** 跑一批 pending：每张落盘 + 增量事件 + 节流进度。 */
+    /**
+     * v3.11.2：空闲心跳。用轻量 id 差集判断是否有新照片，避免每 60 秒全量读 JSONL；
+     * 「继续分析」通过 [resumeSignal] 立刻结束等待，不用等满一个周期。
+     */
+    private suspend fun awaitNextHeartbeat(repository: PhotoRepository) {
+        while (currentCoroutineContext().isActive) {
+            val signal = CompletableDeferred<Unit>()
+            resumeSignal = signal
+            var signaled = false
+            try {
+                withTimeoutOrNull(AnalysisControl.IDLE_HEARTBEAT_MS) {
+                    signal.await()
+                    signaled = true
+                }
+            } finally {
+                if (resumeSignal === signal) resumeSignal = null
+            }
+            if (pausedFlag) continue   // 暂停中：继续等，不触发对账
+            // 用户点「继续分析」被唤醒：立刻回外层重新对账，不等满 60 秒
+            if (signaled) return
+            val fresh = repository.loadAllPhotos().map { it.id }
+            if (AnalysisPlanner.diff(lastAlbumIds, fresh).changed) return
+            // 无变化：再等一个心跳周期；lastAlbumIds 不变，交给下一轮统一对账
+        }
+    }
+
+    /**
+     * v3.11.2：滑动窗口并发跑一批 pending。
+     *  - N 个 worker 从 workChannel 取 id，任何一张完成立刻取下一张（无块屏障）；
+     *  - worker 只负责「分析 + 单张落盘」，结果经 resultChannel 交给唯一协调点；
+     *  - 协调点独占 buffer / done / 进度 / 通知 / 增量事件，无共享可变状态，
+     *    进度逐张 +1 且单调不回退 —— 这是「进度不再跳几百」的关键。
+     */
     private suspend fun runPlan(
         photos: List<PhotoItem>,
         byId: Map<Long, PhotoItem>,
@@ -368,6 +506,9 @@ class AnalysisService : Service() {
         autoTriggered: Boolean
     ) {
         val useVlm = vlmConfig.enabled
+        val parallelism = AnalysisScheduling.coerceParallelism(
+            AppConfig.getAnalysisParallelism(this@AnalysisService)
+        )
         var done = plan.doneCount
         var sinceFlush = 0
         var degradedNotified = false
@@ -376,10 +517,13 @@ class AnalysisService : Service() {
 
         val buffer = ArrayList<Pair<Long, PhotoMetadata>>(RESULT_BATCH_MAX)
         var lastFlushMs = System.currentTimeMillis()
+        lastEmittedProgress = done - 1
+        lastEmitTime = 0L
 
         updateState(
             isRunning = true, progress = done, total = photos.size, isComplete = false,
-            isResumed = plan.resumed, vlmEnabled = useVlm, vlmErrors = 0
+            isResumed = plan.resumed, vlmEnabled = useVlm, vlmErrors = 0,
+            paused = pausedFlag
         )
         val startText = if (plan.resumed) {
             "继续分析：还剩 ${plan.pendingCount} 张（已完成 ${plan.doneCount}）"
@@ -387,90 +531,84 @@ class AnalysisService : Service() {
             "开始分析 ${plan.pendingCount} 张照片"
         }
         updateNotification(startText, done, photos.size)
-        AnalysisEvents.emitWatch(
-            AnalysisEvents.WatchState(active = true, autoAnalyzed = autoAnalyzedCount, analyzing = true)
-        )
+        emitWatch(analyzing = true)
+
+        val workChannel = Channel<Long>(Channel.UNLIMITED)
+        val resultChannel = Channel<Pair<Long, PhotoMetadata?>>(Channel.UNLIMITED)
+        plan.pendingIds.forEach { workChannel.trySend(it) }
+        workChannel.close()
 
         try {
-            // v3.11.1：按「分析并发数」分块并发。块内多张同时分析（ML Kit 的
-            // Labeler / ObjectDetector / FaceDetector 线程安全，解码与推理在各自
-            // 内部线程池并行），块间串行做进度 / 通知 / 增量事件，前端仍只看到
-            // 批处理节奏。并发数 = 1 时每张一块，行为与 v3.11.0 逐张串行一致。
-            val parallelism = AnalysisScheduling.coerceParallelism(
-                AppConfig.getAnalysisParallelism(this@AnalysisService)
-            )
-            val chunks = AnalysisScheduling.chunksOf(plan.pendingIds, parallelism)
-
-            for (chunk in chunks) {
-                // 服务停止 / 被 forceFull 打断时立即退出；此前每张都已单独落盘
-                currentCoroutineContext().ensureActive()
-
-                if (vlmDegraded && !degradedNotified) {
-                    degradedNotified = true
-                    updateNotification("AI 频繁出错，本轮改用本地分析（下次自动补齐）", done, photos.size)
-                }
-
-                val results: List<Pair<Long, PhotoMetadata>> =
-                    if (chunk.size == 1) {
-                        // 串行路径：与旧版相同的单张契约（分析 → 立即落盘）
-                        val id = chunk.first()
-                        val photo = byId[id]
-                        if (photo == null) emptyList() else {
-                            val metadata = analyzeOne(photo, vlmConfig, analyzedMetadata[id], vlmErrorCount)
-                            resultStore.appendResult(id, metadata)      // O(1)，唯一权威
-                            analyzedMetadata[id] = metadata
-                            listOf(id to metadata)
-                        }
-                    } else {
-                        // 并发路径：每张完成即在 worker 内落盘 —— 取消时已完成的
-                        // 照片结果不丢（appendResult 内部有锁，线程安全）
-                        coroutineScope {
-                            chunk.map { id ->
-                                async(Dispatchers.Default) {
-                                    val photo = byId[id] ?: return@async null
-                                    val metadata = analyzeOne(
-                                        photo, vlmConfig, analyzedMetadata[id], vlmErrorCount
-                                    )
-                                    resultStore.appendResult(id, metadata)
-                                    analyzedMetadata[id] = metadata
-                                    id to metadata
+            coroutineScope {
+                val workers = (0 until parallelism).map {
+                    launch(analysisDispatcher) {
+                        for (id in workChannel) {
+                            awaitIfPaused()
+                            currentCoroutineContext().ensureActive()
+                            val photo = byId[id]
+                            val metadata = if (photo == null) null else {
+                                try {
+                                    analyzeOne(photo, vlmConfig, analyzedMetadata[id], vlmErrorCount)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "单张分析失败 [$id]", e)
+                                    PhotoMetadata(photoId = id, isAnalyzed = true)
                                 }
-                            }.mapNotNull { it.await() }
+                            }
+                            if (metadata != null) {
+                                resultStore.appendResult(id, metadata)   // O(1)，唯一权威
+                                analyzedMetadata[id] = metadata
+                            }
+                            resultChannel.send(id to metadata)
                         }
                     }
-
-                buffer += results
-                done += results.size
-                sinceFlush += results.size
-                autoAnalyzedCount += results.size
-                if (sinceFlush >= metaFlushStep) {
-                    resultStore.markProgress(photos.size, done)
-                    sinceFlush = 0
+                }
+                // 所有 worker 结束后关闭结果通道，协调循环自然收尾
+                launch {
+                    workers.joinAll()
+                    resultChannel.close()
                 }
 
-                val now = System.currentTimeMillis()
-                if (IncrementBuffer.shouldFlush(
-                        buffer.size, lastFlushMs, now, RESULT_BATCH_MAX, RESULT_BATCH_INTERVAL_MS
-                    )
-                ) {
-                    val batch = IncrementBuffer.coalesce(buffer)
-                    buffer.clear()
-                    // 增量事件：前端只合并这批 id、只失效这批文档缓存，绝不全量重算
-                    AnalysisEvents.emitResults(AnalysisEvents.ResultBatch(batch, autoTriggered))
-                    AnalysisEvents.emitWatch(
-                        AnalysisEvents.WatchState(true, autoAnalyzedCount, analyzing = true)
-                    )
-                    lastFlushMs = now
+                for ((id, metadata) in resultChannel) {
+                    currentCoroutineContext().ensureActive()
+                    done++                       // 唯一写入点：每张 +1，绝不批量跳变
+                    sinceFlush++
+                    autoAnalyzedCount++
+                    if (metadata != null) buffer += id to metadata
+
+                    if (vlmDegraded && !degradedNotified) {
+                        degradedNotified = true
+                        updateNotification(
+                            "AI 频繁出错，本轮改用本地分析（下次自动补齐）", done, photos.size
+                        )
+                    }
+
+                    if (sinceFlush >= metaFlushStep) {
+                        resultStore.markProgress(photos.size, done)
+                        sinceFlush = 0
+                    }
+
+                    val now = System.currentTimeMillis()
+                    if (IncrementBuffer.shouldFlush(
+                            buffer.size, lastFlushMs, now, RESULT_BATCH_MAX, RESULT_BATCH_INTERVAL_MS
+                        )
+                    ) {
+                        val batch = IncrementBuffer.coalesce(buffer)
+                        buffer.clear()
+                        AnalysisEvents.emitResults(AnalysisEvents.ResultBatch(batch, autoTriggered))
+                        emitWatch(analyzing = true)
+                        lastFlushMs = now
+                    }
+
+                    val statusText = if (useVlm) {
+                        "后台分析 $done / ${photos.size}" +
+                                if (vlmErrorCount.get() > 0) " (AI错误:${vlmErrorCount.get()})" else ""
+                    } else {
+                        "后台分析 $done / ${photos.size}（${parallelism} 路并发）"
+                    }
+                    emitProgress(done, photos.size, plan.resumed, useVlm, vlmErrorCount.get(), statusText)
                 }
 
-                val statusText = if (useVlm) {
-                    "后台分析 $done / ${photos.size}" +
-                            if (vlmErrorCount.get() > 0) " (AI错误:${vlmErrorCount.get()})" else ""
-                } else {
-                    "后台分析照片 $done / ${photos.size}" +
-                            (if (parallelism > 1) "（${parallelism} 路并发）" else "")
-                }
-                emitProgress(done, photos.size, plan.resumed, useVlm, vlmErrorCount.get(), statusText)
+                workers.joinAll()   // 传播 worker 内未捕获异常
             }
 
             if (buffer.isNotEmpty()) {
@@ -481,9 +619,13 @@ class AnalysisService : Service() {
             }
 
             resultStore.markComplete(photos.size, done)
+            // 收尾帧必发，保证最终值 100% 到达 UI
+            emitProgress(done, photos.size, plan.resumed, useVlm, vlmErrorCount.get(),
+                "已分析 $done 张", force = true)
             updateState(
                 isRunning = false, isComplete = true, progress = done, total = photos.size,
-                isResumed = false, vlmEnabled = useVlm, vlmErrors = vlmErrorCount.get()
+                isResumed = false, vlmEnabled = useVlm, vlmErrors = vlmErrorCount.get(),
+                paused = pausedFlag
             )
             val completeMsg = when {
                 useVlm && vlmErrorCount.get() == 0 -> "已分析 ${done} 张照片（含AI描述）"
@@ -508,20 +650,47 @@ class AnalysisService : Service() {
         }
     }
 
+    /**
+     * v3.11.2 暂停门控：worker 在取下一张前调用。暂停时释放 WakeLock、通知切暂停态，
+     * 轮询等到继续后重新持有；用 [AnalysisControl.PAUSE_POLL_MS] 保证最多 300ms 恢复，
+     * 不需要额外唤醒机制，也不会取消 Job（已落盘结果不丢）。
+     */
+    private suspend fun awaitIfPaused() {
+        var entered = false
+        while (pausedFlag && currentCoroutineContext().isActive) {
+            if (!entered) {
+                entered = true
+                releaseWakeLock()
+                val p = _analysisState.value.progress
+                val t = _analysisState.value.total
+                updateState(isRunning = false, paused = true)
+                updateNotification("已暂停分析 · 已完成 $p / $t", p, t)
+                emitWatch(analyzing = false)
+            }
+            delay(AnalysisControl.PAUSE_POLL_MS)
+        }
+        if (entered && !pausedFlag) {
+            acquireWakeLock()
+            updateState(isRunning = true, paused = false)
+            emitWatch(analyzing = true)
+        }
+    }
+
     /** 无待分析照片：更新状态，通知切回「守护中」，但服务不退。 */
-    private fun emitIdle(total: Int, useVlm: Boolean) {
+    private fun emitIdle(total: Int, useVlm: Boolean, progress: Int) {
+        // v3.11.2：不再把 progress 直接设成 total（旧版会让进度条瞬间 100% 再回跳）
         updateState(
-            isRunning = false, isComplete = true, progress = total, total = total,
-            isResumed = false, vlmEnabled = useVlm, vlmErrors = 0
+            isRunning = false, isComplete = true,
+            progress = AnalysisControl.monotonic(_analysisState.value.progress, progress),
+            total = total, isResumed = false, vlmEnabled = useVlm, vlmErrors = 0,
+            paused = pausedFlag
         )
         updateNotification(
             if (autoAnalyzedCount > 0) "后台守护中 · 本次已分析 $autoAnalyzedCount 张，新照片将自动分析"
             else "后台守护中 · 新照片将自动分析",
             0, 0
         )
-        AnalysisEvents.emitWatch(
-            AnalysisEvents.WatchState(active = true, autoAnalyzed = autoAnalyzedCount, analyzing = false)
-        )
+        emitWatch(analyzing = false)
     }
 
     /**
@@ -575,8 +744,6 @@ class AnalysisService : Service() {
                 vlmErrorCount.incrementAndGet()
                 Log.e(TAG, "AI异常 [${photo.id}]", e)
             }
-            // 手动选择是「一次性显式请求」，尝试过就消费，失败也不原地无限重试；
-            // v3.11.1 并发分析下多个 worker 同时到达这里，必须互斥防止丢失消费记录
             if (photo.id in vlmConfig.selectedIds) {
                 synchronized(vlmConsumeLock) {
                     AppConfig.removeVlmSelectedIds(this, listOf(photo.id))
@@ -618,23 +785,33 @@ class AnalysisService : Service() {
         }
     }
 
+    /** v3.11.2：时间节流 + 单调不回退 + 收尾必发最终值。 */
     private fun emitProgress(
         current: Int,
         total: Int,
         isResumed: Boolean,
         vlmEnabled: Boolean,
         vlmErrors: Int,
-        statusText: String
+        statusText: String,
+        force: Boolean = false
     ) {
         val now = System.currentTimeMillis()
-        if (current - lastEmittedProgress < PROGRESS_EMIT_STEP && now - lastEmitTime < 400L) return
-        lastEmittedProgress = current
+        val value = AnalysisControl.monotonic(lastEmittedProgress, current)
+        if (!AnalysisControl.shouldEmit(lastEmittedProgress, value, lastEmitTime, now, force)) return
+        lastEmittedProgress = value
         lastEmitTime = now
         updateState(
-            isRunning = true, progress = current, total = total, isComplete = false,
-            isResumed = isResumed, vlmEnabled = vlmEnabled, vlmErrors = vlmErrors
+            isRunning = true, progress = value, total = total, isComplete = false,
+            isResumed = isResumed, vlmEnabled = vlmEnabled, vlmErrors = vlmErrors,
+            paused = pausedFlag
         )
-        updateNotification(statusText, current, total)
+        updateNotification(statusText, value, total)
+    }
+
+    private fun currentIdleText(): String = when {
+        pausedFlag -> "已暂停分析 · 点「继续分析」从剩余照片续跑"
+        _analysisState.value.isRunning -> "正在分析 ${_analysisState.value.progress} / ${_analysisState.value.total}"
+        else -> "后台守护中 · 新照片将自动分析"
     }
 
     private fun stopWatch() {
@@ -642,20 +819,18 @@ class AnalysisService : Service() {
         analysisJob?.cancel()
         watchActive = false
         completed = true
-        AnalysisEvents.emitWatch(
-            AnalysisEvents.WatchState(active = false, autoAnalyzed = autoAnalyzedCount)
-        )
+        emitWatch(analyzing = false)
+        releaseWakeLock()
         stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    /** 守护关闭时的一次性收尾：注销监听、退出前台、停止服务（不取消正在结束的循环）。 */
+    /** 守护关闭时的一次性收尾：注销监听、退出前台、停止服务。 */
     private fun stopAfterOneShot() {
         observer.unregister(contentResolver)
         watchActive = false
-        AnalysisEvents.emitWatch(
-            AnalysisEvents.WatchState(active = false, autoAnalyzed = autoAnalyzedCount)
-        )
+        emitWatch(analyzing = false)
+        releaseWakeLock()
         stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -667,12 +842,13 @@ class AnalysisService : Service() {
         isComplete: Boolean = _analysisState.value.isComplete,
         isResumed: Boolean = _analysisState.value.isResumed,
         vlmEnabled: Boolean = _analysisState.value.vlmEnabled,
-        vlmErrors: Int = _analysisState.value.vlmErrors
+        vlmErrors: Int = _analysisState.value.vlmErrors,
+        paused: Boolean = _analysisState.value.paused
     ) {
         _analysisState.value = AnalysisProgress(
             isRunning = isRunning, progress = progress, total = total,
             isComplete = isComplete, isResumed = isResumed,
-            vlmEnabled = vlmEnabled, vlmErrors = vlmErrors
+            vlmEnabled = vlmEnabled, vlmErrors = vlmErrors, paused = paused
         )
     }
 
@@ -706,7 +882,24 @@ class AnalysisService : Service() {
             .setOngoing(true)
             .setContentIntent(openIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止守护", stopIntent)
+
+        // v3.11.2：通知栏也提供暂停 / 继续入口，后台不用打开 App 就能控制
+        if (pausedFlag) {
+            val resumeIntent = PendingIntent.getService(
+                this, 3,
+                Intent(this, AnalysisService::class.java).setAction(ACTION_CONTINUE),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.addAction(android.R.drawable.ic_media_play, "继续分析", resumeIntent)
+        } else if (_analysisState.value.isRunning) {
+            val pauseIntent = PendingIntent.getService(
+                this, 2,
+                Intent(this, AnalysisService::class.java).setAction(ACTION_PAUSE_ANALYSIS),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.addAction(android.R.drawable.ic_media_pause, "暂停分析", pauseIntent)
+        }
+        builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止守护", stopIntent)
 
         if (total > 0) builder.setProgress(total, progress, false)
         return builder.build()
@@ -725,11 +918,11 @@ class AnalysisService : Service() {
                 resultStore.markProgress(analyzedMetadata.size, analyzedMetadata.size)
             } catch (_: Exception) { }
         }
-        AnalysisEvents.emitWatch(
-            AnalysisEvents.WatchState(active = false, autoAnalyzed = autoAnalyzedCount)
-        )
+        emitWatch(analyzing = false)
+        releaseWakeLock()
         serviceScope.cancel()
-        analysisExecutor.shutdownNow()
+        analysisPool?.shutdownNow()
+        analysisPool = null
         super.onDestroy()
     }
 }

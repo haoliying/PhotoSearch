@@ -47,15 +47,20 @@ fun main() {
 
     section("A. 并发数收敛")
     check("A1 1..4 原样返回", listOf(1, 2, 3, 4).all { A.coerceParallelism(it) == it })
+    // v3.11.2 把并发上限由 4 提到 8、默认由 2 提到 4（滑动窗口取代块屏障）。
+    // 分块纯函数的语义未变，这里改为引用常量而非硬编码，保持历史评测可复跑。
     check(
         "A2 越界收敛到边界",
         A.coerceParallelism(0) == 1 && A.coerceParallelism(-7) == 1 &&
-                A.coerceParallelism(5) == 4 && A.coerceParallelism(100) == 4 &&
-                A.coerceParallelism(Int.MIN_VALUE) == 1 && A.coerceParallelism(Int.MAX_VALUE) == 4
+                A.coerceParallelism(5) == 5 &&
+                A.coerceParallelism(100) == A.MAX_PARALLELISM &&
+                A.coerceParallelism(Int.MIN_VALUE) == 1 &&
+                A.coerceParallelism(Int.MAX_VALUE) == A.MAX_PARALLELISM
     )
     check(
-        "A3 默认 2 / 范围 1..4",
-        A.DEFAULT_PARALLELISM == 2 && A.MIN_PARALLELISM == 1 && A.MAX_PARALLELISM == 4
+        "A3 默认与上界（v3.11.2 上调）",
+        A.DEFAULT_PARALLELISM == 4 && A.MIN_PARALLELISM == 1 && A.MAX_PARALLELISM == 8 &&
+                A.coerceParallelism(A.DEFAULT_PARALLELISM) == A.DEFAULT_PARALLELISM
     )
 
     section("B. 分块策略")
@@ -70,7 +75,9 @@ fun main() {
     )
     check("B5 空列表 → 无块", A.chunksOf(emptyList<Long>(), 4).isEmpty())
     check("B6 张数少于并发数 → 单块", A.chunksOf(listOf(1L, 2L), 4).size == 1)
-    check("B7 非法并发数按收敛处理", A.chunksOf(ids, 0).all { it.size <= 1 } && A.chunksOf(ids, 99).all { it.size <= 4 })
+    check("B7 非法并发数按收敛处理",
+        A.chunksOf(ids, 0).all { it.size <= 1 } &&
+                A.chunksOf(ids, 99).all { it.size <= A.MAX_PARALLELISM })
 
     section("C. EXIF 方向映射")
     check("C1 ROTATE_90(6) → 90°", A.orientationToDegrees(6) == 90f)

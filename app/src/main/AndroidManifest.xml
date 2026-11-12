@@ -20,6 +20,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- v3.10.0：开机 / 应用升级后恢复「后台自动分析」守护 -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- v3.11.2：熄屏后保持 CPU 运行，否则前台服务虽不被杀，分析协程会被系统冻结，
+         表现就是「退到后台就不分析了」。普通权限，无需动态申请。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:allowBackup="true"

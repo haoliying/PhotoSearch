@@ -15,6 +15,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import android.content.Intent
+import android.provider.Settings
 import com.example.photosearch.data.AppConfig
 import com.example.photosearch.ml.VisionLanguageAnalyzer
 import com.example.photosearch.search.VlmMode
@@ -230,7 +233,7 @@ fun SettingsScreen(
                 }
             }
 
-            // ---------------- 分析并发数（v3.11.1） ----------------
+            // ---------------- 分析速度 / 后台持续分析（v3.11.2） ----------------
             Text(
                 text = "分析速度（端侧识别）",
                 style = MaterialTheme.typography.titleMedium,
@@ -245,7 +248,7 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        "v3.11.1：端侧分析支持多张并行，数万张照片的全量分析时间随并发数近似线性缩短。调得越高越快，但可能发热、前台略有感知。1 路 = 旧版逐张串行（最省电）。",
+                        "v3.11.2：改为滑动窗口真并发——固定 N 张同时分析，谁完成立刻补下一张，不再等整批最慢的那张；并发上限提高到 8。熄屏后持有 CPU 唤醒锁并做低频心跳对账，退到后台也会持续分析新照片。首页与通知栏都提供「暂停 / 继续分析」。",
                         style = MaterialTheme.typography.bodySmall,
                         color = OnSurface.copy(alpha = 0.6f)
                     )
@@ -253,9 +256,9 @@ fun SettingsScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf(
                             1 to "1 路（省电）",
-                            2 to "2 路（均衡）",
-                            3 to "3 路（快速）",
-                            4 to "4 路（极速）"
+                            2 to "2 路",
+                            4 to "4 路（默认）",
+                            8 to "8 路（极速）"
                         ).forEach { (p, label) ->
                             FilterChip(
                                 selected = parallelism == p,
@@ -266,9 +269,24 @@ fun SettingsScreen(
                     }
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "默认 2 路。只影响之后的分析速度，既有分析结果不受影响；是否使用大模型与此无关，两条通道都会提速。",
+                        text = "默认 4 路。只影响之后的分析速度，既有分析结果不受影响；是否使用大模型与此无关。若某档导致发热，退回 1 路即可。",
                         style = MaterialTheme.typography.bodySmall,
                         color = Secondary
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TextButton(onClick = {
+                        try {
+                            context.startActivity(
+                                Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                            )
+                        } catch (_: Exception) { }
+                    }) {
+                        Text("后台仍被系统限制？打开电池优化设置", fontSize = 12.sp)
+                    }
+                    Text(
+                        "部分手机（尤其国产 ROM）会额外限制后台运行，请在系统设置里把本应用设为「不受电池优化限制 / 允许后台运行」。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OnSurface.copy(alpha = 0.55f)
                     )
                 }
             }
@@ -499,6 +517,6 @@ private fun appVersion(context: android.content.Context): String {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
         "v${info.versionName} (${info.versionCode})"
     } catch (e: Exception) {
-        "v3.11.1"
+        "v3.11.2"
     }
 }
