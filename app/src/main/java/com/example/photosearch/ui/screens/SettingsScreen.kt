@@ -43,6 +43,7 @@ fun SettingsScreen(
     }
     var wifiOnly by remember { mutableStateOf(AppConfig.isVlmWifiOnly(context)) }
     var localEnhance by remember { mutableStateOf(AppConfig.isLocalEnhanceEnabled(context)) }
+    var parallelism by remember { mutableStateOf(AppConfig.getAnalysisParallelism(context)) }
     var segmentSize by remember { mutableStateOf(AppConfig.getSegmentSize(context).toString()) }
     var autoResume by remember { mutableStateOf(AppConfig.isAutoResumeEnabled(context)) }
     var backgroundWatch by remember { mutableStateOf(AppConfig.isBackgroundWatchEnabled(context)) }
@@ -229,6 +230,49 @@ fun SettingsScreen(
                 }
             }
 
+            // ---------------- 分析并发数（v3.11.1） ----------------
+            Text(
+                text = "分析速度（端侧识别）",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = OnSurface
+            )
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Surface)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        "v3.11.1：端侧分析支持多张并行，数万张照片的全量分析时间随并发数近似线性缩短。调得越高越快，但可能发热、前台略有感知。1 路 = 旧版逐张串行（最省电）。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OnSurface.copy(alpha = 0.6f)
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(
+                            1 to "1 路（省电）",
+                            2 to "2 路（均衡）",
+                            3 to "3 路（快速）",
+                            4 to "4 路（极速）"
+                        ).forEach { (p, label) ->
+                            FilterChip(
+                                selected = parallelism == p,
+                                onClick = { parallelism = p; saved = false },
+                                label = { Text(label) }
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "默认 2 路。只影响之后的分析速度，既有分析结果不受影响；是否使用大模型与此无关，两条通道都会提速。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Secondary
+                    )
+                }
+            }
+
             // ---------------- 云端服务配置（仅策略非 OFF 时显示） ----------------
             if (mode != VlmMode.OFF) {
                 Text(
@@ -404,6 +448,7 @@ fun SettingsScreen(
                     }
                     AppConfig.setVlmWifiOnly(context, wifiOnly)
                     AppConfig.setLocalEnhanceEnabled(context, localEnhance)
+                    AppConfig.setAnalysisParallelism(context, parallelism)
                     AppConfig.setAutoResumeEnabled(context, autoResume)
                     AppConfig.setBackgroundWatchEnabled(context, backgroundWatch)
                     val size = segmentSize.toIntOrNull()
@@ -454,6 +499,6 @@ private fun appVersion(context: android.content.Context): String {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
         "v${info.versionName} (${info.versionCode})"
     } catch (e: Exception) {
-        "v3.11.0"
+        "v3.11.1"
     }
 }

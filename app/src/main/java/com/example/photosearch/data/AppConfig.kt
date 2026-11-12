@@ -29,6 +29,8 @@ object AppConfig {
     private const val KEY_VLM_WIFI_ONLY = "vlm_wifi_only"
     private const val KEY_VLM_SELECTED_IDS = "vlm_selected_ids"
     private const val KEY_LOCAL_ENHANCE = "local_enhance_enabled"
+    // v3.11.1：端侧分析并发数（不用大模型时的分析速度）
+    private const val KEY_ANALYSIS_PARALLELISM = "analysis_parallelism"
 
     private fun prefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -106,6 +108,32 @@ object AppConfig {
 
     fun setLocalEnhanceEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_LOCAL_ENHANCE, enabled).apply()
+    }
+
+    // ------------------------------------------------------------------
+    // v3.11.1 端侧分析并发数
+    // ------------------------------------------------------------------
+
+    /**
+     * 端侧分析并发数（1..4，默认 2）。
+     * 1 = 与 v3.11.0 一致的逐张串行（最省电、对前台零干扰）；
+     * 4 = 极速（四路并行，首次全量分析明显更快，可能发热）。
+     */
+    fun getAnalysisParallelism(context: Context): Int =
+        com.example.photosearch.service.AnalysisScheduling.coerceParallelism(
+            prefs(context).getInt(
+                KEY_ANALYSIS_PARALLELISM,
+                com.example.photosearch.service.AnalysisScheduling.DEFAULT_PARALLELISM
+            )
+        )
+
+    fun setAnalysisParallelism(context: Context, parallelism: Int) {
+        prefs(context).edit()
+            .putInt(
+                KEY_ANALYSIS_PARALLELISM,
+                com.example.photosearch.service.AnalysisScheduling.coerceParallelism(parallelism)
+            )
+            .apply()
     }
 
     /** 用户手动勾选、明确要求大模型精修的照片 id。 */

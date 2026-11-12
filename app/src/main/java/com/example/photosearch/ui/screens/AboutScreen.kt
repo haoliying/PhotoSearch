@@ -159,6 +159,17 @@ private data class ReleaseInfo(
 
 private val RELEASES = listOf(
     ReleaseInfo(
+        "v3.11.1", "2026-11-12", "不用大模型时的分析速度大幅提升",
+        listOf(
+            "端侧分析由全局单线程串行改为多路并行：ML Kit 的标签 / 物体 / 人脸检测器本就线程安全，此前被逐张调度卡死，数万张照片全量分析要数小时",
+            "设置页新增「分析速度（端侧识别）」：1~4 路并发可选，默认 2 路（吞吐翻倍）；1 路等价旧版逐张串行，随时可回退",
+            "每张照片的文件打开由 3 次降到 1 次：EXIF 方向、量尺寸、解码共用一个文件描述符（lseek 归零复用），失败自动回退旧路径",
+            "批量重分析（多选 → 重新分析）同样按并发数并行；既有断点续跑、增量事件、单张落盘契约全部保持",
+            "并发下「手动选择交给大模型」的消费记录加互斥锁，防止 SharedPreferences 读改写竞态导致无限重试",
+            "新增离线评测覆盖分块调度 / 方向映射 / 并发数收敛；历史 7 套评测全部通过"
+        )
+    ),
+    ReleaseInfo(
         "v3.11.0", "2026-11-11", "大模型可以用 / 可以不用 / 可以挑照片用 · 本地准确度增强",
         listOf(
             "设置页「大模型使用方式」由单个开关升级为 5 种策略：不使用、全部照片、仅新增、仅识别不确定的照片（推荐）、仅手动选择的照片；可完全离线使用",
@@ -260,6 +271,6 @@ private fun currentVersion(context: android.content.Context): String {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
         "v${info.versionName} (${info.versionCode})"
     } catch (e: Exception) {
-        "v3.11.0 (14)"
+        "v3.11.1 (15)"
     }
 }

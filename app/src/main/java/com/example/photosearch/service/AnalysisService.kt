@@ -167,6 +167,9 @@ class AnalysisService : Service() {
     private var lastEmittedProgress = -1
     private var lastEmitTime = 0L
 
+    /** v3.11.1：并发分析时「手动选择消费」的互斥锁，避免 SharedPreferences 读改写竞态。 */
+    private val vlmConsumeLock = Any()
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -389,27 +392,57 @@ class AnalysisService : Service() {
         )
 
         try {
-            for (id in plan.pendingIds) {
+            // v3.11.1：按「分析并发数」分块并发。块内多张同时分析（ML Kit 的
+            // Labeler / ObjectDetector / FaceDetector 线程安全，解码与推理在各自
+            // 内部线程池并行），块间串行做进度 / 通知 / 增量事件，前端仍只看到
+            // 批处理节奏。并发数 = 1 时每张一块，行为与 v3.11.0 逐张串行一致。
+            val parallelism = AnalysisScheduling.coerceParallelism(
+                AppConfig.getAnalysisParallelism(this@AnalysisService)
+            )
+            val chunks = AnalysisScheduling.chunksOf(plan.pendingIds, parallelism)
+
+            for (chunk in chunks) {
                 // 服务停止 / 被 forceFull 打断时立即退出；此前每张都已单独落盘
                 currentCoroutineContext().ensureActive()
-                val photo = byId[id] ?: continue
 
                 if (vlmDegraded && !degradedNotified) {
                     degradedNotified = true
                     updateNotification("AI 频繁出错，本轮改用本地分析（下次自动补齐）", done, photos.size)
                 }
 
-                // 已有本地结果的照片只补云端描述，不重复跑 ML Kit；
-                // 这样「策略判定用的置信度」与计划器完全一致，避免反复排队。
-                val existing = analyzedMetadata[id]
-                val metadata = analyzeOne(photo, vlmConfig, existing, vlmErrorCount)
-                resultStore.appendResult(id, metadata)          // 单张落盘，O(1)，唯一权威
-                analyzedMetadata[id] = metadata
-                buffer += id to metadata
+                val results: List<Pair<Long, PhotoMetadata>> =
+                    if (chunk.size == 1) {
+                        // 串行路径：与旧版相同的单张契约（分析 → 立即落盘）
+                        val id = chunk.first()
+                        val photo = byId[id]
+                        if (photo == null) emptyList() else {
+                            val metadata = analyzeOne(photo, vlmConfig, analyzedMetadata[id], vlmErrorCount)
+                            resultStore.appendResult(id, metadata)      // O(1)，唯一权威
+                            analyzedMetadata[id] = metadata
+                            listOf(id to metadata)
+                        }
+                    } else {
+                        // 并发路径：每张完成即在 worker 内落盘 —— 取消时已完成的
+                        // 照片结果不丢（appendResult 内部有锁，线程安全）
+                        coroutineScope {
+                            chunk.map { id ->
+                                async(Dispatchers.Default) {
+                                    val photo = byId[id] ?: return@async null
+                                    val metadata = analyzeOne(
+                                        photo, vlmConfig, analyzedMetadata[id], vlmErrorCount
+                                    )
+                                    resultStore.appendResult(id, metadata)
+                                    analyzedMetadata[id] = metadata
+                                    id to metadata
+                                }
+                            }.mapNotNull { it.await() }
+                        }
+                    }
 
-                done++
-                sinceFlush++
-                autoAnalyzedCount++
+                buffer += results
+                done += results.size
+                sinceFlush += results.size
+                autoAnalyzedCount += results.size
                 if (sinceFlush >= metaFlushStep) {
                     resultStore.markProgress(photos.size, done)
                     sinceFlush = 0
@@ -434,7 +467,8 @@ class AnalysisService : Service() {
                     "后台分析 $done / ${photos.size}" +
                             if (vlmErrorCount.get() > 0) " (AI错误:${vlmErrorCount.get()})" else ""
                 } else {
-                    "后台分析照片 $done / ${photos.size}"
+                    "后台分析照片 $done / ${photos.size}" +
+                            (if (parallelism > 1) "（${parallelism} 路并发）" else "")
                 }
                 emitProgress(done, photos.size, plan.resumed, useVlm, vlmErrorCount.get(), statusText)
             }
@@ -541,9 +575,12 @@ class AnalysisService : Service() {
                 vlmErrorCount.incrementAndGet()
                 Log.e(TAG, "AI异常 [${photo.id}]", e)
             }
-            // 手动选择是「一次性显式请求」，尝试过就消费，失败也不原地无限重试
+            // 手动选择是「一次性显式请求」，尝试过就消费，失败也不原地无限重试；
+            // v3.11.1 并发分析下多个 worker 同时到达这里，必须互斥防止丢失消费记录
             if (photo.id in vlmConfig.selectedIds) {
-                AppConfig.removeVlmSelectedIds(this, listOf(photo.id))
+                synchronized(vlmConsumeLock) {
+                    AppConfig.removeVlmSelectedIds(this, listOf(photo.id))
+                }
             }
             if (vlmErrorCount.get() >= 20) {
                 vlmDegraded = true

@@ -10,10 +10,13 @@ import com.example.photosearch.ml.VisionLanguageAnalyzer
 import com.example.photosearch.search.*
 import com.example.photosearch.service.AnalysisEvents
 import com.example.photosearch.service.AnalysisPlanner
+import com.example.photosearch.service.AnalysisScheduling
 import com.example.photosearch.service.AnalysisService
 import com.example.photosearch.service.IncrementBuffer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -120,6 +123,9 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
 
     // 并发安全：检索在 Default 线程读，Service / EXIF 提取在别的线程写
     private val metadataCache = ConcurrentHashMap<Long, PhotoMetadata>()
+
+    /** v3.11.1：并发批量重分析时「手动选择消费」的互斥锁（防 SharedPreferences 读改写竞态）。 */
+    private val vlmConsumeLock = Any()
     private var exifCache = ConcurrentHashMap<Long, PhotoExif>()
     private val docCache = ConceptRegistry.SearchDocCache()
 
@@ -983,44 +989,62 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
             val updatedById = HashMap<Long, PhotoItem>(ids.size)
 
             try {
-                for ((index, photoId) in ids.withIndex()) {
-                    ensureActive()
-                    val photo = _state.value.allPhotos.find { it.id == photoId } ?: continue
-                    try {
-                        val onDeviceMetadata = withContext(Dispatchers.IO) {
-                            analyzer.analyzePhoto(photo.uri, context)
-                        }
-                        var description = ""
-                        var vlmKeywords = listOf<String>()
-                        val decision = VlmPolicy.decide(
-                            vlmConfig, photo.id,
-                            isNew = false,
-                            hasDescription = false,
-                            confidence = VlmPolicy.localConfidence(onDeviceMetadata)
-                        )
-                        if (decision.useVlm && vlmAnalyzer != null) {
-                            try {
-                                val vlmResult = vlmAnalyzer.analyzePhoto(photo.uri)
-                                if (vlmResult.success) {
-                                    description = vlmResult.description
-                                    vlmKeywords = vlmResult.keywords
-                                }
-                            } catch (_: Exception) { }
-                            AppConfig.removeVlmSelectedIds(context, listOf(photo.id))
-                        }
-                        val metadata = onDeviceMetadata.copy(
-                            photoId = photo.id, description = description, vlmKeywords = vlmKeywords
-                        )
-                        metadataCache[photo.id] = metadata
-                        AnalysisService.analyzedMetadata[photo.id] = metadata
-                        updatedById[photo.id] = photo.copy(
-                            labels = metadata.labels, metadata = metadata, isAnalyzed = true
-                        )
-                    } catch (_: Exception) { }
+                // v3.11.1：批量重分析同样按「分析并发数」分块并发 —— 块内多张并行
+                // 分析（ML Kit 检测器线程安全），块间串行更新 UI 状态与进度。
+                val parallelism = AnalysisScheduling.coerceParallelism(
+                    AppConfig.getAnalysisParallelism(context)
+                )
+                val chunks = AnalysisScheduling.chunksOf(ids, parallelism)
+                var processedCount = 0
 
-                    // 进度每 10 张刷新一次，避免高频重组
-                    if ((index + 1) % 10 == 0 || index == ids.lastIndex) {
-                        _state.value = _state.value.copy(batchProgress = index + 1)
+                for (chunk in chunks) {
+                    ensureActive()
+                    val processed: List<PhotoItem> = coroutineScope {
+                        chunk.map { photoId ->
+                            async(Dispatchers.IO) {
+                                val photo = _state.value.allPhotos.find { it.id == photoId }
+                                    ?: return@async null
+                                try {
+                                    val onDeviceMetadata = analyzer.analyzePhoto(photo.uri, context)
+                                    var description = ""
+                                    var vlmKeywords = listOf<String>()
+                                    val decision = VlmPolicy.decide(
+                                        vlmConfig, photo.id,
+                                        isNew = false,
+                                        hasDescription = false,
+                                        confidence = VlmPolicy.localConfidence(onDeviceMetadata)
+                                    )
+                                    if (decision.useVlm && vlmAnalyzer != null) {
+                                        try {
+                                            val vlmResult = vlmAnalyzer.analyzePhoto(photo.uri)
+                                            if (vlmResult.success) {
+                                                description = vlmResult.description
+                                                vlmKeywords = vlmResult.keywords
+                                            }
+                                        } catch (_: Exception) { }
+                                        synchronized(vlmConsumeLock) {
+                                            AppConfig.removeVlmSelectedIds(context, listOf(photo.id))
+                                        }
+                                    }
+                                    val metadata = onDeviceMetadata.copy(
+                                        photoId = photo.id, description = description, vlmKeywords = vlmKeywords
+                                    )
+                                    metadataCache[photo.id] = metadata
+                                    AnalysisService.analyzedMetadata[photo.id] = metadata
+                                    photo.copy(
+                                        labels = metadata.labels, metadata = metadata, isAnalyzed = true
+                                    )
+                                } catch (_: Exception) { null }
+                            }
+                        }.mapNotNull { it.await() }
+                    }
+
+                    processed.forEach { updatedById[it.id] = it }
+                    processedCount += processed.size
+
+                    // 进度刷新节流：约每 10 张或每块末更新一次，避免高频重组
+                    if (processedCount % 10 == 0 || chunk === chunks.last()) {
+                        _state.value = _state.value.copy(batchProgress = processedCount)
                     }
                 }
 

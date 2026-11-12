@@ -7,7 +7,10 @@ import android.graphics.Matrix
 import android.graphics.Color as AndroidColor
 import android.media.ExifInterface
 import android.net.Uri
+import android.system.Os
+import android.system.OsConstants
 import com.example.photosearch.data.*
+import com.example.photosearch.service.AnalysisScheduling
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.label.ImageLabeling
 import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
@@ -132,7 +135,67 @@ class EnhancedImageAnalyzer(context: Context) {
         }
     }
 
+    /**
+     * v3.11.1：解码入口。
+     * 优先走 [loadBitmapViaFd]（单文件描述符复用，一次打开完成 EXIF / 量尺寸 / 解码），
+     * 失败自动回退 [loadBitmapViaStreams]（v3.11.0 的三次开流路径）。
+     * 端侧分析慢的主因之一是每张照片要打开文件 3 次，这里降到 1 次。
+     */
     private fun loadBitmap(uri: Uri, context: Context): Bitmap? {
+        loadBitmapViaFd(uri, context)?.let { return it }
+        return loadBitmapViaStreams(uri, context)
+    }
+
+    /**
+     * 单 fd 复用：openAssetFileDescriptor 只打开一次，三个阶段间用 lseek 归零。
+     * ExifInterface(FileDescriptor) 支持随机访问只读头部；decodeFileDescriptor
+     * 从当前偏移开始解码，所以每次解码前 seek 回 0。
+     * 任何一步失败都返回 null，由调用方回退流路径，不影响可用性。
+     */
+    private fun loadBitmapViaFd(uri: Uri, context: Context): Bitmap? {
+        return try {
+            val pfd = context.contentResolver.openAssetFileDescriptor(uri, "r") ?: return null
+            pfd.use { afd ->
+                val fd = afd.fileDescriptor
+                fun seekStart() {
+                    try {
+                        Os.lseek(fd, 0, OsConstants.SEEK_SET)
+                    } catch (_: Exception) {
+                    }
+                }
+
+                // 1) EXIF 方向（随机访问，只读头部）
+                val orientation = try {
+                    seekStart()
+                    ExifInterface(fd).getAttributeInt(
+                        ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL
+                    )
+                } catch (_: Exception) {
+                    ExifInterface.ORIENTATION_NORMAL
+                }
+
+                // 2) 量尺寸
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                seekStart()
+                BitmapFactory.decodeFileDescriptor(fd, null, bounds)
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+                // 3) 按采样解码（max 1024px，与流路径一致）
+                val sampleSize = calculateInSampleSize(bounds.outWidth, bounds.outHeight, 1024, 1024)
+                val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                seekStart()
+                val bitmap = BitmapFactory.decodeFileDescriptor(fd, null, decodeOptions) ?: return null
+
+                rotateBitmap(bitmap, AnalysisScheduling.orientationToDegrees(orientation))
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    /** v3.11.0 的原始路径（保留作回退）：量尺寸 + 解码 + EXIF 各开一次流。 */
+    private fun loadBitmapViaStreams(uri: Uri, context: Context): Bitmap? {
         return try {
             val bitmap = context.contentResolver.openInputStream(uri)?.use { inputStream ->
                 // First pass: get dimensions
@@ -166,23 +229,28 @@ class EnhancedImageAnalyzer(context: Context) {
         return try {
             context.contentResolver.openInputStream(uri)?.use { input ->
                 val exif = ExifInterface(input)
-                val degrees = when (exif.getAttributeInt(
-                    ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL
-                )) {
-                    ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-                    ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-                    ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-                    else -> 0f
-                }
-                if (degrees == 0f) bitmap else {
-                    val matrix = Matrix().apply { postRotate(degrees) }
-                    val rotated = Bitmap.createBitmap(
-                        bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
+                val degrees = AnalysisScheduling.orientationToDegrees(
+                    exif.getAttributeInt(
+                        ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL
                     )
-                    if (rotated !== bitmap) bitmap.recycle()
-                    rotated
-                }
+                )
+                rotateBitmap(bitmap, degrees)
             } ?: bitmap
+        } catch (e: Exception) {
+            bitmap
+        }
+    }
+
+    /** 按角度旋转位图；0 度直接返回原对象，失败时也返回原图。 */
+    private fun rotateBitmap(bitmap: Bitmap, degrees: Float): Bitmap {
+        if (degrees == 0f) return bitmap
+        return try {
+            val matrix = Matrix().apply { postRotate(degrees) }
+            val rotated = Bitmap.createBitmap(
+                bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
+            )
+            if (rotated !== bitmap) bitmap.recycle()
+            rotated
         } catch (e: Exception) {
             bitmap
         }
