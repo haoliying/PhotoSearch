@@ -159,6 +159,17 @@ private data class ReleaseInfo(
 
 private val RELEASES = listOf(
     ReleaseInfo(
+        "v3.11.3", "2026-11-14", "修复大相册（2 万张以上）打开后闪退 · 内存保护",
+        listOf(
+            "定位「打开等一会儿就闪退」：默认守护一打开就自动拉起全量分析，旧版每批结果都对 25000 张做一次全表复制、每轮对账又重新解析 25000 行 JSON，叠加 4 路并发位图与双份元数据，峰值堆溢出后抛 OutOfMemoryError；而所有 catch 都只捕获 Exception，Error 直接冒泡杀掉进程",
+            "前端改为「增量累积 + 阈值合并」：元数据与检索缓存仍即时更新（搜索不受影响），UI 列表全表合并由每 300ms 一次降到大相册每 1.5 秒或累计 200 张一次，分配量降低约一个数量级；分析收尾强制合并残余，结果不丢",
+            "后台服务磁盘全量反序列化由「每轮」改为「仅首轮」，后续复用进程内元数据镜像；任务与结果通道由无界改为有界背压，任何时刻在途数量受控",
+            "位图回收移入 finally：4 个检测器任一异常或内存不足时 768×768 位图也一定释放；并为解码、单张分析、整批分析、服务循环加 OutOfMemoryError 就地降级（自动降并发、不崩进程、结果按差集续跑）",
+            "并发数按相册规模与可用堆自适应收敛（小堆 / 2 万张以上自动降路数），服务协程加全局异常兜底；通知栏刷新由 200ms 降到 900ms，减少高频 Binder 事务",
+            "声明 largeHeap 作为大相册兜底；新增 V314Eval 覆盖内存预算、合并次数、背压容量、OOM 降级与「仅首轮读盘」；历史 9 套评测全部用新源码复跑通过"
+        )
+    ),
+    ReleaseInfo(
         "v3.11.2", "2026-11-12", "真并发提速 · 后台持续分析 · 进度平滑 · 暂停/继续",
         listOf(
             "并发从「整块屏障」改为滑动窗口：固定 N 张同时分析，谁完成立刻补下一张，照片大小差异大时不再被最慢的一张拖住；上限由 4 提高到 8，默认 4 路",
@@ -283,6 +294,6 @@ private fun currentVersion(context: android.content.Context): String {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
         "v${info.versionName} (${info.versionCode})"
     } catch (e: Exception) {
-        "v3.11.2 (16)"
+        "v3.11.3 (17)"
     }
 }

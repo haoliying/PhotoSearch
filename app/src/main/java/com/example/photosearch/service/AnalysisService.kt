@@ -145,20 +145,48 @@ class AnalysisService : Service() {
         val paused: Boolean = false
     )
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    /**
+     * v3.11.3：全局异常兜底。OutOfMemoryError / 未捕获异常不再让进程直接崩掉 ——
+     * 记录日志并把分析状态复位，磁盘已逐张落盘，下次对账会自然续跑。
+     */
+    private val analysisExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        Log.e(TAG, "分析协程未捕获异常（已兜底，不杀进程）", throwable)
+        updateState(isRunning = false, isComplete = false)
+    }
+
+    private val serviceScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Default + analysisExceptionHandler
+    )
 
     /**
      * v3.11.2：分析专用**固定线程池**（低 nice 值），不再是 v3.11.1 的单线程 executor。
      * 池按当前「分析并发数」懒创建，配置变化时重建；onDestroy 才真正 shutdown。
+     * v3.11.3：并发数经 [safeParallelism] 按相册规模 / 可用堆收敛，避免 4 路 Bitmap
+     * 在 2 万张照片、小堆设备上把 native 内存顶满。捕获 OOM 后还可在线再降一级。
      */
     @Volatile
     private var poolParallelism = 0
     private var analysisPool: ExecutorService? = null
     private var analysisDispatcher: CoroutineDispatcher = Dispatchers.Default
+    /** v3.11.3：OOM 在线降级后的并发上限（0 表示未降级）。进程内持续生效。 */
+    @Volatile
+    private var degradedCap = 0
+
+    private fun heapMb(): Int =
+        (Runtime.getRuntime().maxMemory() / (1024L * 1024L)).toInt().coerceAtLeast(64)
+
+    /** 当前实际并发：配置值 → 大相册/小堆收敛 → OOM 降级上限。 */
+    private fun safeParallelism(photoCount: Int): Int {
+        val configured = AnalysisScheduling.coerceParallelism(
+            AppConfig.getAnalysisParallelism(this)
+        )
+        val guarded = MemoryGuard.safeParallelism(configured, photoCount, heapMb())
+        return if (degradedCap > 0) minOf(guarded, degradedCap) else guarded
+    }
 
     @Synchronized
-    private fun prepareAnalysisPool() {
-        val p = AnalysisScheduling.coerceParallelism(AppConfig.getAnalysisParallelism(this))
+    private fun prepareAnalysisPool(photoCount: Int) {
+        val p = safeParallelism(photoCount)
         if (p == poolParallelism && analysisPool != null && !analysisPool!!.isShutdown) return
         analysisPool?.shutdown()
         val pool = Executors.newFixedThreadPool(p) { r ->
@@ -170,6 +198,33 @@ class AnalysisService : Service() {
         analysisPool = pool
         analysisDispatcher = pool.asCoroutineDispatcher()
         poolParallelism = p
+    }
+
+    /**
+     * v3.11.3：捕获 OOM 后在线降一级并发并重建线程池，让后续照片继续分析而不是
+     * 反复撞同一内存上限。降级是进程内持久生效的，最低 1 路，保证功能始终可用。
+     */
+    @Synchronized
+    private fun degradeForOom() {
+        val current = if (degradedCap > 0) degradedCap else safeParallelismRaw()
+        val next = MemoryGuard.degradedParallelism(current)
+        degradedCap = next
+        poolParallelism = 0   // 强制下一轮 prepareAnalysisPool 用新并发重建
+        Log.w(TAG, "内存保护：并发降至 $next 路")
+        try {
+            System.gc()
+            Thread.sleep(200)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (_: Exception) { }
+    }
+
+    /** 未叠加降级上限时的并发（仅用于降级计算，避免递归）。 */
+    private fun safeParallelismRaw(): Int {
+        val configured = AnalysisScheduling.coerceParallelism(
+            AppConfig.getAnalysisParallelism(this)
+        )
+        return MemoryGuard.safeParallelism(configured, lastAlbumIds.size, heapMb())
     }
 
     /** v3.11.2：熄屏后保持 CPU 运行；分析时持有、空闲/暂停时释放。 */
@@ -224,6 +279,8 @@ class AnalysisService : Service() {
     /** v3.11.2：进度上报的上一帧值与时间，跨轮重置，避免节流把首帧吞掉。 */
     private var lastEmittedProgress = -1
     private var lastEmitTime = 0L
+    /** v3.11.3：通知栏刷新时间。进度 StateFlow 仍按 200ms 更新，只有 Binder 降频。 */
+    private var lastNotificationTime = 0L
 
     /** v3.11.2：低频心跳的唤醒信号，「继续分析」时立刻结束等待重新对账。 */
     @Volatile
@@ -362,7 +419,8 @@ class AnalysisService : Service() {
             emitWatch(analyzing = true)
         }
 
-        prepareAnalysisPool()
+        // v3.11.3：并发数依赖相册规模，等拿到第一批 photos 后再初始化线程池。
+        var poolReady = false
         val metaFlushStep = AppConfig.getSegmentSize(this@AnalysisService).coerceIn(10, 200)
         val repository = PhotoRepository(this@AnalysisService)
 
@@ -375,6 +433,10 @@ class AnalysisService : Service() {
             var lastPendingSignature: Set<Long> = emptySet()
             while (currentCoroutineContext().isActive) {
                 val photos = repository.loadAllPhotos()
+                if (!poolReady) {
+                    prepareAnalysisPool(photos.size)
+                    poolReady = true
+                }
                 val ids = photos.map { it.id }
 
                 val delta = AnalysisPlanner.diff(lastAlbumIds, ids)
@@ -395,12 +457,16 @@ class AnalysisService : Service() {
                     uncertainThreshold = vlmConfig.uncertainThreshold
                 )
 
-                val stored = resultStore.load()
-                val analyzed: Map<Long, PhotoMetadata> = stored?.metadataMap ?: emptyMap()
-                if (round == 0) {
+                // v3.11.3：磁盘全量**只在本轮循环开始时读一次**。旧版每一轮对账都
+                // resultStore.load() 重新解析 25000 行 JSON（每行 JSONObject + 反序列化），
+                // 峰值堆与 GC 抖动是大相册闪退的主因之一。此后 analyzedMetadata 是完整
+                // 的进程内镜像（每张落盘时同步写入），直接作为规划输入即可。
+                if (MemoryGuard.shouldReloadFromDisk(round)) {
+                    val stored = resultStore.load()
                     analyzedMetadata.clear()
-                    analyzedMetadata.putAll(analyzed)
+                    stored?.metadataMap?.let { analyzedMetadata.putAll(it) }
                 }
+                val analyzed: Map<Long, PhotoMetadata> = analyzedMetadata
 
                 val plan = AnalysisPlanner.plan(ids, analyzed, planPolicy)
 
@@ -446,6 +512,12 @@ class AnalysisService : Service() {
             }
         } catch (e: CancellationException) {
             throw e
+        } catch (e: OutOfMemoryError) {
+            // v3.11.3：大相册偶发 OOM 不再让进程闪退。降并发、复位状态，
+            // 已逐张落盘的结果下次对账自然续跑；本次循环安全退出。
+            Log.e(TAG, "后台分析内存不足，降级后续跑", e)
+            degradeForOom()
+            updateState(isRunning = false, isComplete = false)
         } catch (e: Exception) {
             Log.e(TAG, "后台分析中断", e)
             updateState(isRunning = false, isComplete = false)
@@ -506,9 +578,8 @@ class AnalysisService : Service() {
         autoTriggered: Boolean
     ) {
         val useVlm = vlmConfig.enabled
-        val parallelism = AnalysisScheduling.coerceParallelism(
-            AppConfig.getAnalysisParallelism(this@AnalysisService)
-        )
+        // v3.11.3：并发按相册规模 / 可用堆收敛，避免 25000 张 × 4 路 Bitmap 顶满内存
+        val parallelism = safeParallelism(photos.size)
         var done = plan.doneCount
         var sinceFlush = 0
         var degradedNotified = false
@@ -533,13 +604,27 @@ class AnalysisService : Service() {
         updateNotification(startText, done, photos.size)
         emitWatch(analyzing = true)
 
-        val workChannel = Channel<Long>(Channel.UNLIMITED)
-        val resultChannel = Channel<Pair<Long, PhotoMetadata?>>(Channel.UNLIMITED)
-        plan.pendingIds.forEach { workChannel.trySend(it) }
-        workChannel.close()
+        // v3.11.3：有界通道 + 背压喂入。旧版 Channel.UNLIMITED 一次性把 25000 个 id
+        // 灌进内存，结果通道还会堆积完整 PhotoMetadata；现在按 capacity 边发边消费。
+        val capacity = MemoryGuard.channelCapacity(parallelism)
+        val workChannel = Channel<Long>(capacity)
+        val resultChannel = Channel<Pair<Long, PhotoMetadata?>>(capacity)
 
         try {
             coroutineScope {
+                // 生产者：只在通道有空位时投递，任何时刻在途 id 数 <= capacity
+                val feeder = launch(Dispatchers.Default) {
+                    try {
+                        for (id in plan.pendingIds) workChannel.send(id)
+                    } catch (_: CancellationException) {
+                        // 服务停止 / forceFull 打断：正常退出
+                    } catch (e: Exception) {
+                        // 通道被提前 cancel（例如 worker 全部退出）：不让它冒泡成整批失败
+                        Log.w(TAG, "任务投递提前结束：${e.message}")
+                    } finally {
+                        try { workChannel.close() } catch (_: Exception) { }
+                    }
+                }
                 val workers = (0 until parallelism).map {
                     launch(analysisDispatcher) {
                         for (id in workChannel) {
@@ -549,6 +634,12 @@ class AnalysisService : Service() {
                             val metadata = if (photo == null) null else {
                                 try {
                                     analyzeOne(photo, vlmConfig, analyzedMetadata[id], vlmErrorCount)
+                                } catch (e: OutOfMemoryError) {
+                                    // v3.11.3：Error 不是 Exception，旧版 catch 抓不到会直接杀进程。
+                                    // 这里就地降级并发、写占位结果，保证本轮不崩、结果不丢。
+                                    Log.e(TAG, "单张分析内存不足，在线降级 [$id]", e)
+                                    degradeForOom()
+                                    PhotoMetadata(photoId = id, isAnalyzed = true)
                                 } catch (e: Exception) {
                                     Log.e(TAG, "单张分析失败 [$id]", e)
                                     PhotoMetadata(photoId = id, isAnalyzed = true)
@@ -565,6 +656,9 @@ class AnalysisService : Service() {
                 // 所有 worker 结束后关闭结果通道，协调循环自然收尾
                 launch {
                     workers.joinAll()
+                    // 兜底：若 worker 全部提前退出，主动取消任务通道，避免生产者
+                    // 永久阻塞在 send（有界通道下必须有这个出口）
+                    try { workChannel.cancel() } catch (_: Exception) { }
                     resultChannel.close()
                 }
 
@@ -608,6 +702,7 @@ class AnalysisService : Service() {
                     emitProgress(done, photos.size, plan.resumed, useVlm, vlmErrorCount.get(), statusText)
                 }
 
+                feeder.join()       // 生产者先收尾，确保不会有残留 id
                 workers.joinAll()   // 传播 worker 内未捕获异常
             }
 
@@ -643,6 +738,17 @@ class AnalysisService : Service() {
             }
             resultStore.markProgress(photos.size, done)
             throw e
+        } catch (e: OutOfMemoryError) {
+            // v3.11.3：内存不足不杀进程，降级并发后由外层循环按差集续跑
+            Log.e(TAG, "单批分析内存不足，在线降级", e)
+            degradeForOom()
+            if (buffer.isNotEmpty()) {
+                AnalysisEvents.emitResults(
+                    AnalysisEvents.ResultBatch(IncrementBuffer.coalesce(buffer), autoTriggered)
+                )
+            }
+            resultStore.markProgress(photos.size, done)
+            updateState(isRunning = false, isComplete = false)
         } catch (e: Exception) {
             Log.e(TAG, "单批分析异常", e)
             resultStore.markProgress(photos.size, done)
@@ -805,7 +911,12 @@ class AnalysisService : Service() {
             isResumed = isResumed, vlmEnabled = vlmEnabled, vlmErrors = vlmErrors,
             paused = pausedFlag
         )
-        updateNotification(statusText, value, total)
+        // v3.11.3：force 帧（收尾 / 暂停 / 完成）必发；其余按 900ms 降频，
+        // 避免 25000 张分析期间数千次构造 PendingIntent + Binder 事务。
+        if (force || MemoryGuard.shouldUpdateNotification(now - lastNotificationTime)) {
+            updateNotification(statusText, value, total)
+            lastNotificationTime = now
+        }
     }
 
     private fun currentIdleText(): String = when {

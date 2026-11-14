@@ -13,6 +13,7 @@ import com.example.photosearch.service.AnalysisPlanner
 import com.example.photosearch.service.AnalysisScheduling
 import com.example.photosearch.service.AnalysisService
 import com.example.photosearch.service.IncrementBuffer
+import com.example.photosearch.service.MemoryGuard
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -131,6 +132,18 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
     private val vlmConsumeLock = Any()
     private var exifCache = ConcurrentHashMap<Long, PhotoExif>()
     private val docCache = ConceptRegistry.SearchDocCache()
+
+    /**
+     * v3.11.3：待合并进 UI 列表的增量结果。
+     * 旧版每收到一批（20 张 / 300ms）就对 25000 个元素做一次全表 map 复制，
+     * 一次全量分析要复制上千次，StateFlow 同时持有新旧两份大列表 —— 这是
+     * 大相册「打开等一会儿就闪退」的主因。现在先按 id 累积（O(k)，后写覆盖），
+     * 达到阈值或分析收尾时才合并一次；metadataCache / 文档缓存仍即时 O(k) 更新，
+     * 搜索与详情的正确性完全不受影响。
+     */
+    private val pendingUiResults = LinkedHashMap<Long, PhotoMetadata>()
+    private val uiMergeLock = Any()
+    private var lastUiMergeMs = 0L
 
     private val _state = MutableStateFlow(PhotoSearchState())
     val state: StateFlow<PhotoSearchState> = _state.asStateFlow()
@@ -530,6 +543,7 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             AnalysisService.analysisState.collect { p ->
                 val remaining = (p.total - p.progress).coerceAtLeast(0)
+                val wasRunning = _state.value.isAnalyzing
                 _state.value = _state.value.copy(
                     isAnalyzing = p.isRunning,
                     analysisProgress = p.progress,
@@ -545,6 +559,9 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                     // v3.11.2：暂停状态由服务单点下发
                     analysisPaused = p.paused
                 )
+                // v3.11.3：分析停止 / 完成 / 暂停时，把累积但未达阈值的增量
+                // 一次性并入 UI 列表，保证最后一批结果一定可见。
+                if (MemoryGuard.shouldFlushUi(wasRunning, p.isRunning)) flushPendingUi()
             }
         }
     }
@@ -583,22 +600,58 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
      */
     private suspend fun absorbIncrement(batch: AnalysisEvents.ResultBatch) {
         if (batch.results.isEmpty()) return
+        // 缓存即时 O(k) 更新：搜索、详情、文档缓存始终看到最新结果，不依赖 UI 合并
         metadataCache.putAll(batch.results)
         docCache.invalidate(IncrementBuffer.idsToInvalidate(batch.results))
 
+        val photoCount = _state.value.allPhotos.size
+        val toMerge = synchronized(uiMergeLock) {
+            batch.results.forEach { (id, m) -> pendingUiResults[id] = m }  // 后写覆盖
+            val now = System.currentTimeMillis()
+            val due = MemoryGuard.shouldMergeUi(
+                pendingUiResults.size, now - lastUiMergeMs, photoCount
+            )
+            if (due) {
+                val snapshot = LinkedHashMap(pendingUiResults)
+                pendingUiResults.clear()
+                lastUiMergeMs = now
+                snapshot
+            } else emptyMap()
+        }
+        if (toMerge.isNotEmpty()) applyUiMerge(toMerge)
+    }
+
+    /**
+     * v3.11.3：分析收尾 / 暂停 / 相册刷新时把残余增量强制合并，避免最后一批
+     * 因未达阈值而丢失。磁盘仍是唯一权威，即使这里漏了下次冷启动也会补齐。
+     */
+    private suspend fun flushPendingUi() {
+        val toMerge: Map<Long, PhotoMetadata> = synchronized(uiMergeLock) {
+            if (pendingUiResults.isEmpty()) {
+                emptyMap()
+            } else {
+                val snapshot = LinkedHashMap<Long, PhotoMetadata>(pendingUiResults)
+                pendingUiResults.clear()
+                lastUiMergeMs = System.currentTimeMillis()
+                snapshot
+            }
+        }
+        if (toMerge.isNotEmpty()) applyUiMerge(toMerge)
+    }
+
+    /** 真正做一次全表合并（O(N)），只在阈值到达或收尾时调用。 */
+    private suspend fun applyUiMerge(toMerge: Map<Long, PhotoMetadata>) {
         val merged = withContext(Dispatchers.Default) {
             val snapshot = _state.value.allPhotos
             snapshot.map { p ->
-                batch.results[p.id]?.let { m ->
+                toMerge[p.id]?.let { m ->
                     p.copy(labels = m.labels, metadata = m, isAnalyzed = true)
                 } ?: p
             }
         }
         // v3.11.2：进度只有一个数据源（AnalysisService.analysisState）。
-        // 旧版这里用全库 metadataCache.count 自己算 doneCount/pendingCount，
-        // 与服务进度两条协程并发写同一状态、口径还不一致，是「进度一次跳几百」
-        // 的根因。现在只更新列表与缓存，进度字段完全不碰；并且基于最新 state
-        // 做 copy，避免把服务刚发布的进度覆盖回旧值。
+        // 这里只更新列表与缓存，进度字段完全不碰；基于最新 state 做 copy，
+        // 避免把服务刚发布的进度覆盖回旧值。
         val latest = _state.value
         val hasQuery = latest.searchQuery.isNotBlank() ||
                 latest.timeRange != null || latest.locationQuery != null

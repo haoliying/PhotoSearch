@@ -248,7 +248,7 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        "v3.11.2：改为滑动窗口真并发——固定 N 张同时分析，谁完成立刻补下一张，不再等整批最慢的那张；并发上限提高到 8。熄屏后持有 CPU 唤醒锁并做低频心跳对账，退到后台也会持续分析新照片。首页与通知栏都提供「暂停 / 继续分析」。",
+                        "v3.11.2 起滑动窗口真并发——固定 N 张同时分析，谁完成立刻补下一张；上限 8 路。熄屏持有 CPU 唤醒锁并做低频心跳对账，退到后台也持续分析。首页与通知栏提供「暂停 / 继续分析」。v3.11.3：照片超过 8000 张或可用内存偏小时会自动收敛并发，防止内存不足闪退；此时这里选的高档位是「上限」而非强制值。",
                         style = MaterialTheme.typography.bodySmall,
                         color = OnSurface.copy(alpha = 0.6f)
                     )
@@ -269,7 +269,7 @@ fun SettingsScreen(
                     }
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "默认 4 路。只影响之后的分析速度，既有分析结果不受影响；是否使用大模型与此无关。若某档导致发热，退回 1 路即可。",
+                        text = "默认 4 路，2 万张以上相册会自动降到 2~4 路（内存保护，属正常现象）。只影响之后的分析速度，既有结果不受影响，与是否使用大模型无关。发热可退回 1 路。",
                         style = MaterialTheme.typography.bodySmall,
                         color = Secondary
                     )
@@ -517,6 +517,6 @@ private fun appVersion(context: android.content.Context): String {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
         "v${info.versionName} (${info.versionCode})"
     } catch (e: Exception) {
-        "v3.11.2"
+        "v3.11.3"
     }
 }

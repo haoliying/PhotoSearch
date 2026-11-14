@@ -24,11 +24,14 @@
          表现就是「退到后台就不分析了」。普通权限，无需动态申请。 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- v3.11.3：2 万张以上相册的分析结果元数据 + 索引常驻内存，
+         普通堆上限容易触发 OOM 闪退；声明大堆作为兜底（配合 MemoryGuard 限流）。 -->
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
+        android:largeHeap="true"
         android:theme="@style/Theme.PhotoSearch">
 
         <activity

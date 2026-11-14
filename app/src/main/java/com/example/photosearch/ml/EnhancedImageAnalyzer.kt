@@ -75,9 +75,17 @@ class EnhancedImageAnalyzer(context: Context) {
      *  - 多张照片真并行（v3.11.1 强制 Default 会让所有 worker 挤同一个池）。
      */
     suspend fun analyzePhoto(uri: Uri, context: Context): PhotoMetadata {
-        return try {
-                val bitmap = loadBitmap(uri, context) ?: return PhotoMetadata(photoId = 0)
+        // v3.11.3：bitmap 用 try/finally 保证回收。旧版只在成功路径 recycle，
+        // 4 个检测器任一抛异常（或 OOM）时 768×768×4B≈2.25MB 位图直接泄漏；
+        // 25000 张 × 4 路并发下累积泄漏足以触发 OOM 闪退。
+        val bitmap = try {
+            loadBitmap(uri, context)
+        } catch (e: OutOfMemoryError) {
+            System.gc()
+            return PhotoMetadata(photoId = 0, isAnalyzed = true)
+        } ?: return PhotoMetadata(photoId = 0)
 
+        return try {
                 // Run all analyses in parallel
                 val (labels, objects, faces, colors) = coroutineScope {
                     val labelsDeferred = async { detectLabels(bitmap) }
@@ -110,8 +118,6 @@ class EnhancedImageAnalyzer(context: Context) {
                 val width = bitmap.width
                 val height = bitmap.height
 
-                if (!bitmap.isRecycled) bitmap.recycle()
-
                 PhotoMetadata(
                     photoId = 0, // Will be set by caller
                     labels = labelList,
@@ -130,9 +136,15 @@ class EnhancedImageAnalyzer(context: Context) {
                     faceCount = faceList.size,
                     sceneTags = sceneTags
                 )
+        } catch (e: OutOfMemoryError) {
+            // Error 不是 Exception：旧版 catch(Exception) 抓不到会直接冒泡杀进程
+            System.gc()
+            PhotoMetadata(photoId = 0, isAnalyzed = true)
         } catch (e: Exception) {
             e.printStackTrace()
             PhotoMetadata(photoId = 0, isAnalyzed = true)
+        } finally {
+            if (!bitmap.isRecycled) bitmap.recycle()
         }
     }
 
