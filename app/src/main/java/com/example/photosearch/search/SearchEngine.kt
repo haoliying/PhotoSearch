@@ -11,9 +11,12 @@ import com.example.photosearch.data.PhotoMetadata
  * v3.5.2 修复召回率：概念通道 + 全文通道双路检索。
  * v3.6.0 新增时空联动：时间区间、地点（模糊 / 半径）作为硬过滤条件，
  *         与内容条件按 AND 组合；只有筛选器时返回全部通过过滤的照片。
- * v3.11.4 新增「搜索准确度」：用户可设定匹配度门槛，标签/关键词证据的
- *         匹配度 >= 准确度（且不低于通道质量基线）才算命中。
- *         默认 50% 与 v3.11.3 逐位一致；详见 [MatchAccuracy]。
+ * v3.11.4 新增「搜索准确度」：用户可设定匹配度门槛。
+ * v3.11.5 修复「严格档搜不到、但照片标着 90%」：
+ *         - 通道召回恢复固定质量基线（默认档与 v3.11.3 逐位一致）；
+ *         - 命中证据经 MatchAccuracy.toPercent 拉伸成 50~100 的「综合匹配度」；
+ *         - 综合匹配度既是列表展示值、也是与准确度比较的唯一判定值；
+ *         - 详见 [MatchAccuracy]。
  *
  * 时间来源优先级：EXIF DateTimeOriginal > 文件名时间戳 > MediaStore DATE_TAKEN。
  * 无时间或时间落在区间外的照片不参与时间筛选；无地点信息的照片不参与地点筛选。
@@ -39,7 +42,10 @@ object SearchEngine {
         val score: Float,
         val matchedConditions: List<String>,
         val matchSource: String = "",
-        /** v3.11.4：0..100 的综合匹配度，供结果列表展示。 */
+        /**
+         * 综合匹配度 0..100。v3.11.5 起它与准确度门槛比较用的是同一个数，
+         * 因此结果列表里显示多少，就意味着它至少通过了多少的门槛。
+         */
         val matchPercent: Int = 0
     )
 
@@ -48,15 +54,27 @@ object SearchEngine {
         val hit: Boolean,        // 原始命中（未考虑 negated）
         val effective: Boolean,  // 考虑 negated 后是否通过
         val score: Float,
-        val source: String
+        val source: String,
+        /** v3.11.5：该条件命中证据换算出的综合匹配度（0 表示未命中）。 */
+        val percent: Int
     )
 
-    /** v3.11.4：一次查询内复用，避免为几万张照片重复计算阈值。 */
+    /** v3.11.5：一次查询内复用。通道基线固定，不随用户准确度抬高。 */
     private data class MatchThresholds(
         val concept: Float,
         val text: Float,
         val expand: Float
     )
+
+    /** v3.11.5：单条件命中结果。percent 用与展示/终判同源的 50~100 刻度。 */
+    private data class Hit(
+        val matched: Boolean,
+        val score: Float,
+        val source: String,
+        val percent: Int
+    )
+
+    private fun miss(): Hit = Hit(false, 0f, "", 0)
 
     /**
      * v3.8.0：
@@ -73,17 +91,15 @@ object SearchEngine {
         isActive: () -> Boolean = { true },
         /** v3.11.0：是否启用不依赖大模型的本地准确度增强。 */
         localEnhance: Boolean = true,
-        /** v3.11.4：标签与关键字的匹配度门槛（%）。默认 50 = 与旧版完全一致。 */
+        /** v3.11.5：综合匹配度门槛（%）。默认 50 = 与旧版完全一致。 */
         accuracyPercent: Int = MatchAccuracy.DEFAULT_PERCENT
     ): List<SearchResult> {
         if (intent.conditions.isEmpty() && !intent.hasFilters) return emptyList()
 
-        // 阈值只算一次：实际阈值 = max(通道质量基线, 用户准确度)
-        val thresholds = MatchThresholds(
-            concept = MatchAccuracy.threshold(MIN_EVIDENCE, accuracyPercent),
-            text = MatchAccuracy.threshold(TEXT_MIN_EVIDENCE, accuracyPercent),
-            expand = MatchAccuracy.threshold(EXPAND_MIN_EVIDENCE, accuracyPercent)
-        )
+        val accuracy = MatchAccuracy.coerce(accuracyPercent)
+        // v3.11.5：召回门槛固定为引擎质量基线。准确度只作用于最终综合匹配度，
+        // 不再抬高高通道阈值 —— 否则端侧证据上限 0.80 会让「严格 80%」全库 0 结果。
+        val thresholds = MatchThresholds(MIN_EVIDENCE, TEXT_MIN_EVIDENCE, EXPAND_MIN_EVIDENCE)
 
         return photos.mapIndexedNotNull { index, photo ->
             if (index % 256 == 0 && !isActive()) throw SearchCancelledException()
@@ -103,8 +119,7 @@ object SearchEngine {
             }
 
             // ---- 只有时间/地点筛选，没有内容词 ----
-            // v3.11.4：结构化筛选是精确匹配，不属于「标签与关键字的匹配度」，
-            // 不受准确度门槛约束，否则把准确度调到 80% 会让按时间筛选直接 0 结果。
+            // 结构化筛选是精确匹配，不属于「标签与关键字的匹配度」，按 100% 计。
             if (intent.filtersOnly) {
                 return@mapIndexedNotNull SearchResult(
                     photo = photo,
@@ -128,15 +143,14 @@ object SearchEngine {
             val docIndex = doc.index
 
             val evals = intent.conditions.map { cond ->
-                val (hit, score, source) = evaluateCondition(
-                    cond, metadata, evidence, docIndex, localEnhance, thresholds
-                )
+                val h = evaluateCondition(cond, metadata, evidence, docIndex, localEnhance, thresholds)
                 ConditionEval(
                     condition = cond,
-                    hit = hit,
-                    effective = if (cond.negated) !hit else hit,
-                    score = if (cond.negated) 0f else score,
-                    source = source
+                    hit = h.matched,
+                    effective = if (cond.negated) !h.matched else h.matched,
+                    score = if (cond.negated) 0f else h.score,
+                    source = h.source,
+                    percent = if (cond.negated) 0 else h.percent
                 )
             }
 
@@ -151,7 +165,24 @@ object SearchEngine {
             }
             val avgScore = if (weight > 0f) total / weight else if (negativeOk) 0.5f else 0f
 
-            val pass = negativeOk && when (intent.logicOperator) {
+            // v3.11.5：综合匹配度 = 命中条件的匹配度按权重加权平均（未命中条件不计入分母，
+            // 避免 OR 模式下被 0 分拉低）。纯排除条件查询没有正向条件，按 100% 计并豁免门槛。
+            var pTotal = 0f
+            var pWeight = 0f
+            positive.forEach {
+                if (it.hit && it.percent > 0) {
+                    pTotal += it.percent * it.condition.weight
+                    pWeight += it.condition.weight
+                }
+            }
+            val noPositive = positive.isEmpty()
+            val matchPercent = when {
+                pWeight > 0f -> (pTotal / pWeight + 0.5f).toInt().coerceIn(0, 100)
+                noPositive -> 100
+                else -> 0
+            }
+
+            val logicOk = when (intent.logicOperator) {
                 LogicOperator.AND -> evals.all { it.effective }
                 // 排除条件只做否决，不参与 OR 命中判定（否则恒为真、全库返回）
                 LogicOperator.OR -> positive.any { it.effective } || positive.isEmpty()
@@ -160,6 +191,10 @@ object SearchEngine {
                     minScore >= RANK_MIN_CONDITION && avgScore >= RANK_THRESHOLD
                 }
             }
+            // v3.11.5 唯一终判：展示值与门槛同源，>= 才算匹配。
+            // 纯排除条件查询（无正向条件）豁免，否则「没有汽车」在任何档位都会 0 结果。
+            val accuracyOk = noPositive || MatchAccuracy.meetsPercent(matchPercent, accuracy)
+            val pass = negativeOk && logicOk && accuracyOk
 
             if (!pass || avgScore <= 0f) return@mapIndexedNotNull null
 
@@ -168,7 +203,7 @@ object SearchEngine {
                 score = avgScore,
                 matchedConditions = intent.conditions.map { conditionLabel(it) } + filterLabels(intent),
                 matchSource = evals.maxByOrNull { it.score }?.source ?: "",
-                matchPercent = MatchAccuracy.percentOf(avgScore)
+                matchPercent = matchPercent
             )
         }.sortedByDescending { it.score }
     }
@@ -197,26 +232,25 @@ object SearchEngine {
         evidence: Map<Concept, Float>,
         index: ConceptRegistry.SearchIndex,
         localEnhance: Boolean,
-        /** v3.11.4：随用户准确度抬高的各通道门槛。 */
         thresholds: MatchThresholds
-    ): Triple<Boolean, Float, String> {
+    ): Hit {
         // 通道 1：规范概念（精确率最高）
         val concept = condition.concept
         if (concept != null) {
             val w = evidence[concept] ?: 0f
-            // v3.11.4：排除条件只做否决、不产生结果，固定用引擎基线判定。
-            // 若跟着用户准确度抬高，调到 90% 时「没有汽车」会把含汽车的
-            // 弱证据照片重新放回结果 —— 否决力度反而变弱，与「更准」相悖。
+            // 排除条件只做否决、不产生结果，固定用引擎基线判定。
             val gate = if (condition.negated) MIN_EVIDENCE else thresholds.concept
-            if (w >= gate) return Triple(true, w, "concept:${concept.name}")
+            if (w >= gate) {
+                return Hit(true, w, "concept:${concept.name}", MatchAccuracy.toPercent(w, MIN_EVIDENCE))
+            }
         }
 
         // 排除条件：只用严格关键词匹配做否决，不启用全文通道
         if (condition.negated) {
             for (keyword in condition.keywords) {
-                if (strictMatch(keyword, metadata)) return Triple(true, 0.6f, "keyword")
+                if (strictMatch(keyword, metadata)) return Hit(true, 0.6f, "keyword", 0)
             }
-            return Triple(false, 0f, "")
+            return miss()
         }
 
         // 通道 2：全文检索（召回词表外的词，含 EXIF 地名/年份）。
@@ -226,7 +260,9 @@ object SearchEngine {
         for (term in terms) {
             val s = index.score(term)
             if (s > 0f) weakHits += s
-            if (s >= thresholds.text) return Triple(true, s, "text:$term")
+            if (s >= thresholds.text) {
+                return Hit(true, s, "text:$term", MatchAccuracy.toPercent(s, TEXT_MIN_EVIDENCE))
+            }
         }
 
         // ---- v3.11.0 新增通路（只在不启用增强时跳过，旧行为完全保留）----
@@ -241,7 +277,10 @@ object SearchEngine {
                     agg += sorted[i] * (0.30f - (i - 1) * 0.06f)
                 }
                 if (agg >= thresholds.text) {
-                    return Triple(true, agg.coerceAtMost(1f), "text:multi(${weakHits.size})")
+                    return Hit(
+                        true, agg.coerceAtMost(1f), "text:multi(${weakHits.size})",
+                        MatchAccuracy.toPercent(agg, TEXT_MIN_EVIDENCE)
+                    )
                 }
             }
 
@@ -250,11 +289,14 @@ object SearchEngine {
             for (term in condition.expandedKeywords) {
                 val s = index.score(term)
                 if (s >= thresholds.expand) {
-                    return Triple(true, s * EXPAND_SCORE_FACTOR, "expand:$term")
+                    return Hit(
+                        true, s * EXPAND_SCORE_FACTOR, "expand:$term",
+                        MatchAccuracy.toPercent(s, EXPAND_MIN_EVIDENCE)
+                    )
                 }
             }
         }
-        return Triple(false, 0f, "")
+        return miss()
     }
 
     /**

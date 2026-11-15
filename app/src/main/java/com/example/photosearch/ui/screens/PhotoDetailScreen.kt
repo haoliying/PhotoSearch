@@ -347,7 +347,7 @@ fun PhotoDetailScreen(
                         // Labels
                         if (metadata.labels.isNotEmpty()) {
                             Text(
-                                text = "内容标签",
+                                text = "内容标签（角标为识别置信度）",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Medium
                             )
@@ -492,7 +492,9 @@ private fun LabelChip(text: String, confidence: Float) {
             )
             Spacer(modifier = Modifier.width(4.dp))
             Text(
-                text = "${percentage}%",
+                // v3.11.5：明确标注这是「识别置信度」，不是搜索的综合匹配度，
+                // 避免用户拿标签上的 90% 去对照设置页的「准确度 80%」产生误解。
+                text = "置信 ${percentage}%",
                 fontSize = 11.sp,
                 color = ChipText.copy(alpha = 0.7f)
             )

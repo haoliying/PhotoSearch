@@ -227,8 +227,12 @@ fun main() {
     )
     check("H1 每个结果的匹配度都在 0..100",
         resultsH.all { it.matchPercent in 0..100 })
-    check("H2 匹配度与 percentOf(score) 一致",
-        resultsH.all { it.matchPercent == A.percentOf(it.score) })
+    // v3.11.5 口径升级说明：v3.11.4 的 matchPercent = percentOf(avgScore)（内部证据分口径），
+    // 与用户设定的准确度不在同一刻度，导致「照片标着 90%、严格 80% 却搜不到」。
+    // v3.11.5 起 matchPercent 改为 50~100 的综合匹配度，且判定与展示同源，
+    // 因此本断言改为「结果匹配度必然 >= 门槛」，等价契约由 V316Eval 完整覆盖。
+    check("H2 v3.11.5：结果匹配度必然 >= 当前准确度门槛（展示与判定同源）",
+        resultsH.all { it.matchPercent >= 80 && it.matchPercent in 50..100 })
     check("H3 结果按 score 降序排列",
         resultsH.map { it.score } == resultsH.map { it.score }.sortedDescending())
     check("H4 默认档下弱证据也带匹配度（列表视图可展示）",

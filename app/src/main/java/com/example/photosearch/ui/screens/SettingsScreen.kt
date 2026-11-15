@@ -252,7 +252,7 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "只有「照片标签 / 描述与搜索关键字的匹配度」≥ 设定值时，才算匹配并出现在结果里。数值越高越严格、结果越少越精确；调低不会引入明显不相关的照片（最低为引擎质量基线 50%）。",
+                        text = "只有「综合匹配度」≥ 设定值时，照片才会出现在结果里。列表视图显示的「综合匹配度 XX%」就是用来和这个门槛比较的同一个数：显示 90% 就一定通过了 80% 的门槛。数值越高越严格、结果越少越精确。",
                         style = MaterialTheme.typography.bodySmall,
                         color = OnSurface.copy(alpha = 0.65f)
                     )
@@ -288,7 +288,7 @@ fun SettingsScreen(
                     }
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "默认 50% 与旧版完全一致。只影响搜索结果，不改动已保存的分析结果，无需重新分析照片。时间 / 地点属于精确筛选，不参与匹配度判定；列表视图会显示每张结果的综合匹配度。",
+                        text = "默认 50% 与旧版完全一致，只影响搜索结果、无需重新分析照片。注意：照片详情里标签角标的「置信 XX%」是模型识别置信度，与这里的综合匹配度是两种刻度，不能直接对照；时间 / 地点属于精确筛选，不参与匹配度判定。",
                         style = MaterialTheme.typography.bodySmall,
                         color = Secondary
                     )
@@ -581,6 +581,6 @@ private fun appVersion(context: android.content.Context): String {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
         "v${info.versionName} (${info.versionCode})"
     } catch (e: Exception) {
-        "v3.11.4"
+        "v3.11.5"
     }
 }
