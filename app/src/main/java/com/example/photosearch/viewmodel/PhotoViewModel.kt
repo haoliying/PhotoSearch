@@ -94,7 +94,10 @@ data class PhotoSearchState(
     val vlmSelectedCount: Int = 0,
     val vlmUncertainThreshold: Float = 0.55f,
     // v3.11.2 暂停 / 继续分析
-    val analysisPaused: Boolean = false
+    val analysisPaused: Boolean = false,
+    // v3.11.4 搜索准确度（%）与本次检索每张结果的综合匹配度（%）
+    val matchAccuracy: Int = MatchAccuracy.DEFAULT_PERCENT,
+    val matchPercents: Map<Long, Int> = emptyMap()
 )
 
 /** computeFilters 的产物，主线程一次性写入 StateFlow。 */
@@ -104,7 +107,9 @@ private data class FilterOutcome(
     val description: String?,
     val summary: String?,
     val noTime: Int,
-    val noLoc: Int
+    val noLoc: Int,
+    /** v3.11.4：photoId -> 综合匹配度(%)，供列表项展示。 */
+    val matchPercents: Map<Long, Int> = emptyMap()
 )
 
 /** v3.10.0：相册变化增量刷新的计算结果（O(N) 计算放在 Dispatchers.Default）。 */
@@ -215,7 +220,8 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                     vlmSelectedCount = AppConfig.getVlmSelectedIds(getApplication()).size,
                     vlmUncertainThreshold = AppConfig.getUncertainThreshold(getApplication()),
                     vlmSummary = vlmSummaryOf(),
-                    analysisPaused = AppConfig.isAnalysisPaused(getApplication())
+                    analysisPaused = AppConfig.isAnalysisPaused(getApplication()),
+                    matchAccuracy = AppConfig.getMatchAccuracy(getApplication())
                 )
                 scheduleFilters(0)
                 extractExif(photos)
@@ -357,6 +363,7 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                 filterSummary = outcome.summary,
                 noTimeCount = outcome.noTime,
                 noLocationCount = outcome.noLoc,
+                matchPercents = outcome.matchPercents,
                 isSearching = false
             )
         }
@@ -394,7 +401,9 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                 cache = docCache,
                 isActive = { gen == filterGeneration && isActive() },
                 // v3.11.0：设置页可关闭本地增强，关闭后检索行为与 v3.10.0 完全一致
-                localEnhance = st.localEnhanceEnabled
+                localEnhance = st.localEnhanceEnabled,
+                // v3.11.4：匹配度门槛。默认 50% 与 v3.11.3 逐位一致
+                accuracyPercent = st.matchAccuracy
             )
         } catch (_: SearchEngine.SearchCancelledException) {
             return null
@@ -418,7 +427,8 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
             description = if (q.isBlank()) null else IntentParser.getDescription(q),
             summary = summary,
             noTime = noTime,
-            noLoc = noLoc
+            noLoc = noLoc,
+            matchPercents = results.associate { it.photo.id to it.matchPercent }
         )
     }
 
@@ -849,7 +859,8 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
             localEnhanceEnabled = AppConfig.isLocalEnhanceEnabled(app),
             vlmSelectedCount = AppConfig.getVlmSelectedIds(app).size,
             vlmUncertainThreshold = AppConfig.getUncertainThreshold(app),
-            vlmSummary = vlmSummaryOf()
+            vlmSummary = vlmSummaryOf(),
+            matchAccuracy = AppConfig.getMatchAccuracy(app)
         )
         docCache.clear()
         val plan = computePlan(_state.value.allPhotos)
@@ -996,6 +1007,22 @@ class PhotoViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         }
+    }
+
+    /**
+     * v3.11.4：设置页调整「搜索准确度」后即时生效，无需重新分析照片。
+     *
+     * 准确度是查询期参数：文档缓存（概念证据 + 全文索引）与它无关，
+     * 因此这里不清空 docCache —— 调档不会重建几万张照片的索引，
+     * 只重跑一次检索，几万张下也不会卡顿。
+     */
+    fun setMatchAccuracy(percent: Int) {
+        val app = getApplication<Application>()
+        val value = MatchAccuracy.coerce(percent)
+        if (value == _state.value.matchAccuracy) return
+        AppConfig.setMatchAccuracy(app, value)
+        _state.value = _state.value.copy(matchAccuracy = value)
+        scheduleFilters(0)
     }
 
     /**

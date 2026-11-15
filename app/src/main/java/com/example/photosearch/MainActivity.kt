@@ -180,7 +180,10 @@ class MainActivity : ComponentActivity() {
                                 // v3.11.2 暂停 / 继续分析
                                 analysisPaused = state.analysisPaused,
                                 onPauseAnalysis = { viewModel.pauseBackgroundAnalysis() },
-                                onContinueAnalysis = { viewModel.continueBackgroundAnalysis() }
+                                onContinueAnalysis = { viewModel.continueBackgroundAnalysis() },
+                                // v3.11.4 搜索准确度与匹配度展示
+                                matchAccuracy = state.matchAccuracy,
+                                matchPercents = state.matchPercents
                             )
                         }
                     }

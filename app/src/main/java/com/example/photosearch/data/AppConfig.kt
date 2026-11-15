@@ -33,6 +33,8 @@ object AppConfig {
     private const val KEY_ANALYSIS_PARALLELISM = "analysis_parallelism"
     // v3.11.2：用户显式「暂停分析」，持久化；服务被系统重建后仍保持暂停
     private const val KEY_ANALYSIS_PAUSED = "analysis_paused"
+    // v3.11.4：搜索准确度（标签与关键字的匹配度门槛，百分比）
+    private const val KEY_MATCH_ACCURACY = "match_accuracy_percent"
 
     private fun prefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -234,5 +236,31 @@ object AppConfig {
 
     fun setAnalysisPaused(context: Context, paused: Boolean) {
         prefs(context).edit().putBoolean(KEY_ANALYSIS_PAUSED, paused).apply()
+    }
+
+    // ------------------------------------------------------------------
+    // v3.11.4 搜索准确度
+    // ------------------------------------------------------------------
+
+    /**
+     * 「标签与搜索关键字的匹配度」门槛（%），范围 50..95，默认 50（与 v3.11.3 一致）。
+     * 由 [com.example.photosearch.search.MatchAccuracy] 统一收敛，旧配置或异常值
+     * 都不会让检索行为失控。
+     */
+    fun getMatchAccuracy(context: Context): Int =
+        com.example.photosearch.search.MatchAccuracy.coerce(
+            prefs(context).getInt(
+                KEY_MATCH_ACCURACY,
+                com.example.photosearch.search.MatchAccuracy.DEFAULT_PERCENT
+            )
+        )
+
+    fun setMatchAccuracy(context: Context, percent: Int) {
+        prefs(context).edit()
+            .putInt(
+                KEY_MATCH_ACCURACY,
+                com.example.photosearch.search.MatchAccuracy.coerce(percent)
+            )
+            .apply()
     }
 }

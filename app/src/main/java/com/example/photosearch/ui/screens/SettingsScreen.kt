@@ -20,8 +20,10 @@ import android.content.Intent
 import android.provider.Settings
 import com.example.photosearch.data.AppConfig
 import com.example.photosearch.ml.VisionLanguageAnalyzer
+import com.example.photosearch.search.MatchAccuracy
 import com.example.photosearch.search.VlmMode
 import com.example.photosearch.ui.theme.*
+import kotlin.math.roundToInt
 
 /**
  * v3.11.0：把「启用云端 AI 分析」的单个开关升级为完整的大模型使用策略：
@@ -46,6 +48,8 @@ fun SettingsScreen(
     }
     var wifiOnly by remember { mutableStateOf(AppConfig.isVlmWifiOnly(context)) }
     var localEnhance by remember { mutableStateOf(AppConfig.isLocalEnhanceEnabled(context)) }
+    // v3.11.4：搜索准确度（标签与关键字的匹配度门槛）
+    var matchAccuracy by remember { mutableStateOf(AppConfig.getMatchAccuracy(context)) }
     var parallelism by remember { mutableStateOf(AppConfig.getAnalysisParallelism(context)) }
     var segmentSize by remember { mutableStateOf(AppConfig.getSegmentSize(context).toString()) }
     var autoResume by remember { mutableStateOf(AppConfig.isAutoResumeEnabled(context)) }
@@ -227,6 +231,64 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         text = "关闭后检索行为与 v3.10.0 完全一致，可用于对比准确度。详细原理见「操作手册」。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Secondary
+                    )
+                }
+            }
+
+            // ---------------- 搜索准确度（v3.11.4） ----------------
+            Text(
+                text = "搜索准确度（标签匹配门槛）",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = OnSurface
+            )
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Surface)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "只有「照片标签 / 描述与搜索关键字的匹配度」≥ 设定值时，才算匹配并出现在结果里。数值越高越严格、结果越少越精确；调低不会引入明显不相关的照片（最低为引擎质量基线 50%）。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OnSurface.copy(alpha = 0.65f)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = "当前：$matchAccuracy% · ${MatchAccuracy.labelOf(matchAccuracy)}",
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = Primary
+                    )
+                    Text(
+                        text = MatchAccuracy.summary(matchAccuracy),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OnSurface.copy(alpha = 0.6f)
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Slider(
+                        value = matchAccuracy.toFloat(),
+                        onValueChange = { matchAccuracy = it.roundToInt(); saved = false },
+                        valueRange = MatchAccuracy.MIN_PERCENT.toFloat()..MatchAccuracy.MAX_PERCENT.toFloat(),
+                        steps = (MatchAccuracy.MAX_PERCENT - MatchAccuracy.MIN_PERCENT) /
+                                MatchAccuracy.STEP_PERCENT - 1,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        MatchAccuracy.PRESETS.forEach { preset ->
+                            FilterChip(
+                                selected = matchAccuracy == preset.percent,
+                                onClick = { matchAccuracy = preset.percent; saved = false },
+                                label = { Text(preset.label) }
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "默认 50% 与旧版完全一致。只影响搜索结果，不改动已保存的分析结果，无需重新分析照片。时间 / 地点属于精确筛选，不参与匹配度判定；列表视图会显示每张结果的综合匹配度。",
                         style = MaterialTheme.typography.bodySmall,
                         color = Secondary
                     )
@@ -466,6 +528,8 @@ fun SettingsScreen(
                     }
                     AppConfig.setVlmWifiOnly(context, wifiOnly)
                     AppConfig.setLocalEnhanceEnabled(context, localEnhance)
+                    // v3.11.4：保存后 onVlmConfigChanged() 会重跑一次检索，即时生效
+                    AppConfig.setMatchAccuracy(context, matchAccuracy)
                     AppConfig.setAnalysisParallelism(context, parallelism)
                     AppConfig.setAutoResumeEnabled(context, autoResume)
                     AppConfig.setBackgroundWatchEnabled(context, backgroundWatch)
@@ -517,6 +581,6 @@ private fun appVersion(context: android.content.Context): String {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
         "v${info.versionName} (${info.versionCode})"
     } catch (e: Exception) {
-        "v3.11.3"
+        "v3.11.4"
     }
 }

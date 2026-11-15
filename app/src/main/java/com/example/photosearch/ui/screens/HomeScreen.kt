@@ -33,6 +33,7 @@ import com.example.photosearch.data.PhotoExif
 import com.example.photosearch.data.PhotoItem
 import com.example.photosearch.data.chineseDisplayTags
 import com.example.photosearch.search.LocationQuery
+import com.example.photosearch.search.MatchAccuracy
 import com.example.photosearch.search.PlaceCatalog
 import com.example.photosearch.search.PlaceSuggestion
 import com.example.photosearch.search.TimeQueryParser
@@ -123,7 +124,10 @@ fun HomeScreen(
     // v3.11.2 暂停 / 继续分析
     analysisPaused: Boolean = false,
     onPauseAnalysis: () -> Unit = {},
-    onContinueAnalysis: () -> Unit = {}
+    onContinueAnalysis: () -> Unit = {},
+    // v3.11.4：搜索准确度与本次检索每张结果的综合匹配度（列表视图展示）
+    matchAccuracy: Int = MatchAccuracy.DEFAULT_PERCENT,
+    matchPercents: Map<Long, Int> = emptyMap()
 ) {
     var showSearch by rememberSaveable { mutableStateOf(false) }
     var showFilters by rememberSaveable { mutableStateOf(false) }
@@ -158,7 +162,8 @@ fun HomeScreen(
                             if (!isLoading) {
                                 Text(
                                     when {
-                                        hasConditions -> "$searchResultCount 张结果"
+                                        // v3.11.4：把当前准确度直接显示在结果数旁，调档后立刻可见
+                                        hasConditions -> "$searchResultCount 张结果 · 准确度 $matchAccuracy%"
                                         else -> "共 ${photos.size} 张照片"
                                     },
                                     color = Color.White.copy(alpha = 0.75f),
@@ -389,6 +394,7 @@ fun HomeScreen(
                             photos = photos,
                             listMode = listMode,
                             exifMap = exifMap,
+                            matchPercents = matchPercents,
                             selectionMode = selectionMode,
                             selectedIds = selectedIds,
                             onPhotoClick = onPhotoClick,
@@ -928,6 +934,8 @@ private fun PhotoCollection(
     photos: List<PhotoItem>,
     listMode: Boolean,
     exifMap: Map<Long, PhotoExif>,
+    /** v3.11.4：仅列表视图展示，网格保持纯缩略图。 */
+    matchPercents: Map<Long, Int> = emptyMap(),
     selectionMode: Boolean,
     selectedIds: Set<Long>,
     onPhotoClick: (PhotoItem) -> Unit,
@@ -944,6 +952,7 @@ private fun PhotoCollection(
                 PhotoListItem(
                     photo = photo,
                     exif = exifMap[photo.id],
+                    matchPercent = matchPercents[photo.id],
                     selectionMode = selectionMode,
                     isSelected = selectedIds.contains(photo.id),
                     onClick = {
@@ -981,6 +990,8 @@ private fun PhotoCollection(
 private fun PhotoListItem(
     photo: PhotoItem,
     exif: PhotoExif?,
+    /** v3.11.4：本次检索的综合匹配度(%)，无查询时为 null。 */
+    matchPercent: Int? = null,
     selectionMode: Boolean,
     isSelected: Boolean,
     onClick: () -> Unit,
@@ -1044,6 +1055,16 @@ private fun PhotoListItem(
             Column(modifier = Modifier.weight(1f)) {
                 Text(photo.displayName, fontSize = 13.sp, fontWeight = FontWeight.Medium,
                     color = OnSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                // v3.11.4：只在有检索条件时显示，便于对照设置页的准确度门槛
+                if (matchPercent != null) {
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        text = "综合匹配度 $matchPercent%",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Primary
+                    )
+                }
                 Spacer(Modifier.height(4.dp))
                 InfoLine(Icons.Default.DateRange, timeText)
                 InfoLine(Icons.Default.Place, placeText)
